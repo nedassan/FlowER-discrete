@@ -43,7 +43,7 @@ $ sh run.sh
 ```
 
 ### 2. Validate FlowER
-You can validate FlowER on the validation set. Then, in `settings.py`, ensure these are uncommented
+You can validate FlowER on the validation set. Then, in `settings.py`, ensure these are uncommented.
 ```
     # validation #
     do_validate = True
@@ -56,7 +56,7 @@ $ sh run.sh
 ```
 
 ### 3. Test FlowER
-You can validate FlowER on the test set. Then, in `settings.py`, specify your checkpoint at `MODEL_NAME` and ensure these are uncommented
+You can validate FlowER on the test set. Then, in `settings.py`, specify your checkpoint at `MODEL_NAME` and ensure these are uncommented.
 ```
     # inference #
     do_validate = False
@@ -67,7 +67,7 @@ $ sh run.sh
 ```
 
 ### 4. Use FlowER for search
-FlowER mainly uses beam search to seek for plausible mechanistic pathways. Users can input their smiles at `data/flower_dataset/beam.txt`
+FlowER mainly uses beam search to seek for plausible mechanistic pathways. Users can input their smiles at `data/flower_dataset/beam.txt`. <br>
 Ensure that in `settings.py`, `test_path` variable is pointing towards the corresponding file, and beam search configuration are uncommented.
 ```
     test_path = f"data/{DATA_NAME}/beam.txt"

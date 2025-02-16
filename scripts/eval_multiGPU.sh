@@ -7,4 +7,4 @@ torchrun \
   --rdzv-id=456 \
   --rdzv-backend=c10d \
   --rdzv-endpoint="$MASTER_ADDR:$MASTER_PORT" \
-  beam_predict_multiGPU.py
+  eval_multiGPU.py

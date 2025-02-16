@@ -13,7 +13,7 @@ export MASTER_ADDR=localhost
 export MASTER_PORT=1235
 
 
-# sh scripts/train.sh
+sh scripts/train.sh
 # sh scripts/eval_multiGPU.sh
 # sh scripts/search.sh
-sh scripts/search_multiGPU.sh
+# sh scripts/search_multiGPU.sh

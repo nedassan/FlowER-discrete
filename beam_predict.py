@@ -202,7 +202,7 @@ def main(args, seed=0):
     for i, chunk in enumerate(chunked_list):
         log_rank_0(f"Group Chunk-{i} called:")
         checkpoint = os.path.join(args.model_path, args.model_name)
-        state = torch.load(checkpoint)
+        state = torch.load(checkpoint, weights_only=False, map_location=device)
         pretrain_args = state["args"]
         pretrain_args.load_from = None
         pretrain_args.device = device

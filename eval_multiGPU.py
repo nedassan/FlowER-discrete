@@ -262,7 +262,7 @@ def main(args):
 
 
     for ckpt_i, checkpoint in enumerate(checkpoints):
-        state = torch.load(checkpoint)
+        state = torch.load(checkpoint, weights_only=False, map_location=device)
         pretrain_args = state["args"]
         pretrain_args.load_from = None
         pretrain_args.device = device

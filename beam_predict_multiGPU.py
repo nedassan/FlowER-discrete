@@ -216,7 +216,7 @@ def worker(rank, args, chunk, chunk_idx, lock, queue):
     
     # Load model for this process
     checkpoint = os.path.join(args.model_path, args.model_name)
-    state = torch.load(checkpoint, map_location=device)
+    state = torch.load(checkpoint, weights_only=False, map_location=device)
     pretrain_args = state["args"]
     pretrain_args.load_from = None
     pretrain_args.device = device
@@ -242,6 +242,7 @@ def worker(rank, args, chunk, chunk_idx, lock, queue):
         if ">>" in line:
             ori_reactant = line.strip().split(">>")[0]
             products = line.strip().split(">>")[1].split("|")
+            products = [Chem.MolToSmiles(Chem.MolFromSmiles(smi)) for smi in products]
         else:
             ori_reactant = line.strip()
             products = []

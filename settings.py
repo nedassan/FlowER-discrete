@@ -4,12 +4,12 @@ import os
 DATA_NAME = os.environ.get("DATA_NAME", "USPTO")
 EXP_NAME = os.environ.get("EXP_NAME", "")
 
-TRAIN_BATCH_SIZE = 8192
-VAL_BATCH_SIZE = 4096
-
-SCALE = 1
+SCALE = 2
 SAMPLE_SIZE = 64 // SCALE
 NUM_GPU = int(os.environ.get("NUM_GPUS_PER_NODE", 1))
+
+TRAIN_BATCH_SIZE = 4096 * NUM_GPU
+VAL_BATCH_SIZE = 4096 * NUM_GPU
 TEST_BATCH_SIZE = (512 * NUM_GPU * SCALE)
 
 NUM_NODES = int(os.environ.get("NUM_NODES", 1))
@@ -21,6 +21,7 @@ MODEL_NAME = "model.1440000_47.pt"
 
 
 class Args:
+    # train #
     model_name = MODEL_NAME
     exp_name = EXP_NAME
     train_path = f"data/{DATA_NAME}/train.txt" 
@@ -65,7 +66,7 @@ class Args:
     accumulation_count = ACCUMULATION_COUNT
     save_iter = 30000
     log_iter = 100
-    eval_iter = 500
+    eval_iter = 30000
 
     sample_size = SAMPLE_SIZE
     sym_break_noise_stdv = 0.02
@@ -75,11 +76,11 @@ class Args:
     rbf_gap = 0.1
 
 
-    # # validation #
+    # validation #
     # do_validate = True
     # steps2validate =  ["1050000", "1320000", "1500000", "930000", "1020000"]
     
-    # # inference # 
+    # inference # 
     do_validate = False
 
     # beam-search #

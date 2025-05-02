@@ -69,8 +69,6 @@ class Args:
     eval_iter = 30000
 
     sample_size = SAMPLE_SIZE
-    sym_break_noise_stdv = 0.02
-
     rbf_low = 0
     rbf_high = 8
     rbf_gap = 0.1

@@ -85,3 +85,11 @@ $ sh run.sh
 Visualize your route at `examples/vis_network.ipynb`
 
 ## Citation
+```
+@article{joung2025electron,
+  title={Electron flow matching for generative reaction mechanism prediction obeying conservation laws},
+  author={Joung, Joonyoung F and Fong, Mun Hong and Casetti, Nicholas and Liles, Jordan P and Dassanayake, Ne S and Coley, Connor W},
+  journal={arXiv preprint arXiv:2502.12979},
+  year={2025}
+}
+```

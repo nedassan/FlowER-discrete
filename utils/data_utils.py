@@ -65,17 +65,36 @@ def get_formal_charge(a, electron):
     f =v -  electron  - b - h
     return f
 
-def BEmatrix_to_mol(rmol, matrix, idxfunc=lambda x:x.GetIdx()):
-    atom_dict = {}
-    bond_dict = {}
+def mol_prop_compute(matrix):
+    """
+    vectorized way of computing atom dict and bond dict from matrix
+    """
     n = matrix.shape[0]
-    for i in range(n):
-        for j in range(i, n):
-            if i != j:
-                if matrix[i, j] != 0 or matrix[j, i] != 0:
-                    bond_dict[(i+1, j+1)] = int(matrix[i, j] + matrix[j, i])
-            else:
-                atom_dict[(i+1, j+1)] = int(matrix[i, j])
+
+    # 1) Compute symmetric bond sums once:
+    Mplus = matrix + matrix.T
+
+    # 2) Extract all off-diagonal i<j where there's at least one bond
+    iu, ju = np.triu_indices(n, k=1)
+    vals = Mplus[iu, ju]
+    mask = vals != 0
+
+    # 3) Build bond_dict
+    bond_dict = {
+        (i + 1, j + 1): int(val)
+        for i, j, val in zip(iu[mask], ju[mask], vals[mask])
+    }
+    # 5) Build atom_dict from the diagonal
+    diag = matrix.diagonal()
+    atom_dict = {
+            (i + 1, i + 1): int(diag_val)
+        for i, diag_val in enumerate(diag)
+    }
+    return atom_dict, bond_dict
+
+
+def BEmatrix_to_mol(rmol, matrix, idxfunc=lambda x:x.GetIdx()):
+    atom_dict, bond_dict = mol_prop_compute(matrix)
                 
     new_mol = Chem.RWMol(rmol)
     new_mol.UpdatePropertyCache(strict=False)

@@ -7,6 +7,7 @@ import numpy as np
 from rdkit import Chem
 import torchdiffeq
 from utils.data_utils import ReactionDataset, BEmatrix_to_mol, ps
+from utils.rounding import saferound_tensor
 import torch.distributed as dist
 from train import init_model, init_loader
 from utils.train_utils import log_rank_0, setup_logger, log_args
@@ -40,11 +41,16 @@ def redist_fix(pred_matrix, reac_smi, reac_be_matrix):
 
     return pred_matrix
 
+# # old implementation uses CPU
+# def redistribute_round(x):
+#     rounded_diff = iteround.saferound(x.flatten().cpu().numpy().tolist(), 0)
+#     rounded_diff = torch.as_tensor(rounded_diff, dtype=torch.float).view(*x.shape)
+#     return rounded_diff.to(x)
 
+# new implementation uses GPU
 def redistribute_round(x):
-    rounded_diff = iteround.saferound(x.flatten().cpu().numpy().tolist(), 0)
-    rounded_diff = torch.as_tensor(rounded_diff, dtype=torch.float).view(*x.shape)
-    return rounded_diff.to(x)
+    rounded = saferound_tensor(x, places=0, strategy="difference")
+    return rounded
 
 def custom_round(x):
     output = []

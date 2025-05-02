@@ -1,4 +1,4 @@
-torch>=1.11.0
+torch==2.4.0
 numpy==1.26.4
 torchdiffeq==0.2.4
 rdkit==2024.3.3

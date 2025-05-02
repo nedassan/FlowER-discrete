@@ -130,7 +130,7 @@ Visualize your route at `examples/vis_network.ipynb`
 
 #### FlowER search input
 FlowER takes in a non atom-mapped reaction for beam search which can be specified in `beam.txt`
-The format of reactants in the file follows `reactant>>product1|product2, where we can specify multiple major and minor products separated by `|` in the file
+The format of reactants in the file follows `reactant>>product1|product2|...`, where we can specify multiple major and minor products separated by `|` in the file
 ```
 CC(=O)CC(=O)C(F)(F)F.NNc1cccc(Br)c1>>Cc1cc(C(F)(F)F)n(-c2cccc(Br)c2)n1
 CC(=O)CC(=O)C(F)(F)F.NNc1cccc(Br)c1>>Cc1cc(C(F)(F)F)n(-c2cccc(Br)c2)n1|Cc1cc(C(F)(F)F)nn1-c1cccc(Br)c1

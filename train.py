@@ -27,7 +27,7 @@ def init_dist(args):
     if args.local_rank != -1:
         dist.init_process_group(backend=args.backend,
                                 init_method='env://',
-                                timeout=datetime.timedelta(0, 7200))
+                                timeout=datetime.timedelta(minutes=10))
         torch.cuda.set_device(args.local_rank)
         torch.backends.cudnn.benchmark = False
 
@@ -262,6 +262,8 @@ def main(args):
         if args.local_rank != -1:
             dist.barrier()
     log_rank_0("Epoch ended")
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     args = Args

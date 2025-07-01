@@ -191,6 +191,7 @@ class SALayerXL(nn.Module):
         )
         self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
         self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
+        self.layer_norm_2 = nn.LayerNorm(d_model, eps=1e-6)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, inputs, mask, rel_emb):
@@ -205,21 +206,21 @@ class SALayerXL(nn.Module):
 
             * outputs ``(batch_size, src_len, model_dim)``
         """
-        input_norm = self.layer_norm(inputs)
-        context, _ = self.self_attn(input_norm, mask=mask, rel_emb=rel_emb)
+        normed_inputs = self.layer_norm(inputs)
+        context, _ = self.self_attn(normed_inputs, mask=mask, rel_emb=rel_emb)
         out = self.dropout(context) + inputs
-
-        return self.feed_forward(out)
+        return self.feed_forward(self.layer_norm_2(out)) + out
 
 class Block(nn.Module):
     def __init__(self, size: int):
         super().__init__()
 
         self.ff = nn.Linear(size, size)
-        self.act = nn.SELU()
+        self.act = nn.GELU()
+        self.layer_norm = nn.LayerNorm(size, eps=1e-6)
 
     def forward(self, x: torch.Tensor):
-        return x + self.act(self.ff(x))
+        return x + self.layer_norm(self.act(self.ff(x)))
 
 class AttnEncoderXL(nn.Module):
     def __init__(self, args):
@@ -227,6 +228,7 @@ class AttnEncoderXL(nn.Module):
         self.args = args
         self.device = args.device
         self.num_layers = args.enc_num_layers
+        self.post_processing_layers = args.post_processing_layers
         self.d_model = args.emb_dim
         self.heads = args.enc_heads
         self.d_ff = args.enc_filter_size
@@ -261,31 +263,34 @@ class AttnEncoderXL(nn.Module):
                     self.u, self.v)
                  for i in range(self.num_layers)])
         self.layer_norm = nn.LayerNorm(self.d_model, eps=1e-6)
-            
+        
         self.query_w = torch.nn.Sequential(
-            Block(self.d_model),
+            *[Block(self.d_model) for _ in range(self.post_processing_layers)]
         )
         self.key_w = torch.nn.Sequential(
-            Block(self.d_model),
+            *[Block(self.d_model) for _ in range(self.post_processing_layers)]
         )
 
         self.query_diag_w = torch.nn.Sequential(
-            Block(self.d_model),
+            *[Block(self.d_model) for _ in range(self.post_processing_layers)]
         )
         self.key_diag_w = torch.nn.Sequential(
-            Block(self.d_model),
+            *[Block(self.d_model) for _ in range(self.post_processing_layers)]
         )
         self.value_diag_w = torch.nn.Sequential(
-            Block(self.d_model),
+            *[Block(self.d_model) for _ in range(self.post_processing_layers)]
         )
         self.final_diag_w = torch.nn.Linear(self.d_model, 1)
 
-        self.rel_emb_w = torch.nn.Linear(self.d_model, 1)
+        self.rel_emb_w = torch.nn.Sequential(
+            *[*[Block(self.d_model) for _ in range(self.post_processing_layers)], 
+            torch.nn.Linear(self.d_model, 1)]
+        )
         self.softmax = nn.Softmax(dim=-1)
 
         rbf_layers = []
         # rbf_layers.append(torch.nn.Linear(self.rbf.dim+1, self.rbf.dim))
-        for _ in range(1):
+        for _ in range(self.post_processing_layers):
             rbf_layers.append(Block(self.rbf.dim))
         self.rbf_linear = torch.nn.Sequential(*rbf_layers)
         self.rbf_final_linear = torch.nn.Linear(self.rbf.dim, 1)

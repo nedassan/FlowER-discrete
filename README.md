@@ -25,21 +25,21 @@ To retrain/reproduce FlowER, download `data.zip` and `checkpoints.zip` folder fr
 The folder structure for the `data` folder is `data/{DATASET_NAME}/{train,val,test}.txt` and `checkpoints` folder is `checkpoints/{DATASET_NAME}/{EXPERIMENT_NAME}/model.{STEP}_{IDX}.pt`
 
 ## On how FlowER is structured
-The workflow of FlowER revolves mainly around 2 files. `run.sh` and `settings.py`. <br> 
+The workflow of FlowER revolves mainly around 2 files. `run_FlowER_large_(old|new)Data.sh` and `settings.py`. <br> 
 The main idea is to use comments `#` to turn on/off configurations when training/validating/inferencing FlowER. <br>
-`run.sh` allows user to specify your data folder name, experiment name, gpu configuration and choose which scripts to run. <br>
+`run_FlowER_large_(old|new)Data.sh` allows user to specify your data folder name, experiment name, gpu configuration and choose which scripts to run. <br>
 `settings.py` allows user to specify different configurations for different workflows. 
 
 ## Training Pipeline
 ### 1. Train FlowER
-Ensure that `data/` folder is populated accordingly and `settings.py` is pointing to the correct files.
+Ensure that `data/` folder is populated accordingly and `run_FlowER_large_(old|new)Data.sh` is pointing to the correct files.
 ```
-    train_path = f"data/{DATA_NAME}/train.txt" 
-    val_path = f"data/{DATA_NAME}/val.txt"
+export TRAIN_FILE=$PWD/data/$DATA_NAME/train.txt
+export VAL_FILE=$PWD/data/$DATA_NAME/val.txt
 ```
-Check `run.sh` has `scripts/train.sh` uncommented. 
+Check `run_FlowER_large_(old|new)Data.sh` has `scripts/train.sh` uncommented. 
 ```bash
-$ sh run.sh
+$ sh run_FlowER_large_(old|new)Data.sh
 ```
 
 ### 2. Validate FlowER
@@ -50,9 +50,9 @@ You can validate FlowER on the validation set. Then, in `settings.py`, ensure th
     steps2validate =  ["1050000", "1320000", "1500000", "930000", "1020000"]
 ```
 `steps2validate` refers to the checkpoints that are selected based on train logs situated at the `/logs` folder. <br>
-Check `run.sh` has `scripts/eval.sh` uncommented. 
+Check `run_FlowER_large_(old|new)Data.sh` has `scripts/eval.sh` uncommented. 
 ```bash
-$ sh run.sh
+$ sh run_FlowER_large_(old|new)Data.sh
 ```
 
 
@@ -62,9 +62,9 @@ You can validate FlowER on the test set. Then, in `settings.py`, specify your ch
     # inference #
     do_validate = False
 ```
-Check `run.sh` has `scripts/eval.sh` uncommented. 
+Check `run_FlowER_large_(old|new)Data.sh` has `scripts/eval.sh` uncommented. 
 ```bash
-$ sh run.sh
+$ sh run_FlowER_large_(old|new)Data.sh
 ```
 
 #### FlowER train/valid/test input
@@ -112,7 +112,11 @@ An elementary reaction step reaction follows the format of `mapped_reaction|sequ
 
 ### 4. Use FlowER for search
 FlowER mainly uses beam search to seek for plausible mechanistic pathways. Users can input their smiles at `data/flower_dataset/beam.txt`. <br>
-Ensure that in `settings.py`, `test_path` variable is pointing towards the corresponding file, and beam search configuration are uncommented.
+Ensure that in `run_FlowER_large_(old|new)Data.sh`, the `TEST_FILE` variable is pointing towards the correct file.
+```
+export TEST_FILE=$PWD/data/$DATA_NAME/beam.txt
+```
+Ensure that in `settings.py`, beam search configuration are uncommented and specified accordingly.
 ```
     test_path = f"data/{DATA_NAME}/beam.txt"
 
@@ -122,9 +126,9 @@ Ensure that in `settings.py`, `test_path` variable is pointing towards the corre
     max_depth = 15
     chunk_size = 50
 ```
-Check `run.sh` has `scripts/search.sh` or `sh scripts/search_multiGPU.sh` uncommented. 
+Check `run_FlowER_large_(old|new)Data.sh` has `scripts/search.sh` or `sh scripts/search_multiGPU.sh` uncommented. 
 ```bash
-$ sh run.sh
+$ sh run_FlowER_large_(old|new)Data.sh
 ```
 Visualize your route at `examples/vis_network.ipynb`
 

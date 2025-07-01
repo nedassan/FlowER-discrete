@@ -21,7 +21,7 @@ $ pip install -r requirements.txt
 
 ## Data/Model preparation
 FlowER is trained on a combination of subset of USPTO-FULL (Dai et al.), RmechDB and PmechDB (Baldi et al.). <br>
-To retrain/reproduce FlowER, download `data.zip` and `checkpoints.zip` folder from [this link](https://figshare.com/articles/dataset/FlowER_-_Mechanistic_datasets_and_model_checkpoint/28359407/2), and unzip them, and place under `FlowER/` <br>
+To retrain/reproduce FlowER, download `data.zip` and `checkpoints.zip` folder from [this link](https://figshare.com/articles/dataset/FlowER_-_Mechanistic_datasets_and_model_checkpoint/28359407/3), and unzip them, and place under `FlowER/` <br>
 The folder structure for the `data` folder is `data/{DATASET_NAME}/{train,val,test}.txt` and `checkpoints` folder is `checkpoints/{DATASET_NAME}/{EXPERIMENT_NAME}/model.{STEP}_{IDX}.pt`
 
 ## On how FlowER is structured

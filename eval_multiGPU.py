@@ -63,13 +63,7 @@ def split_number(number, num_parts):
 
 def tau_leaping_batch(model, y_emb, y_len, x0, steps=100, device='cuda'):
     """
-    Performs factorized batched Tau-Leaping inference.
-    
-    Args:
-        model: Refactored AttnEncoderXL returning (s_prop, t_prop).
-        y_emb, y_len: Atom features.
-        x0: Initial BE matrices (B, N, N).
-        steps: Number of integration steps.
+    Performs joint factorized Tau-Leaping inference to ensure mass conservation.
     """
     B, N, _ = x0.shape
     xt = x0.clone()
@@ -81,26 +75,37 @@ def tau_leaping_batch(model, y_emb, y_len, x0, steps=100, device='cuda'):
         t = time_grid[i]
         t_batch = torch.full((B,), t, device=device)
 
-        s_prop, t_prop = model(y_emb, y_len, xt, t_batch)
+        s_logits, t_logits = model(y_emb, y_len, xt, t_batch)
 
-        sum_s = s_prop.sum(dim=(1, 2), keepdim=True)
-        sum_t = t_prop.sum(dim=(1, 2), keepdim=True)
+        s_logits = 0.5 * (s_logits + s_logits.transpose(1, 2))
+        t_logits = 0.5 * (t_logits + t_logits.transpose(1, 2))
 
-        global_rate = (sum_s * sum_t).view(B)
+        s_probs = torch.softmax(s_logits.view(B, -1), dim=-1).view(B, N, N)
+        t_probs = torch.softmax(t_logits.view(B, -1), dim=-1).view(B, N, N)
+
+        sum_s = torch.exp(s_logits).sum(dim=(1, 2))
+        sum_t = torch.exp(t_logits).sum(dim=(1, 2))
+        global_rate = sum_s * sum_t
+        
         total_jumps = torch.poisson(global_rate * dt)
 
-        if total_jumps.sum() == 0:
-            continue
+        for b in range(B):
+            n_jumps = int(total_jumps[b].item())
+            if n_jumps == 0: continue
 
-        s_probs = s_prop / (sum_s + 1e-9)
-        t_probs = t_prop / (sum_t + 1e-9)
+            src_indices = torch.multinomial(s_probs[b].flatten(), n_jumps, replacement=True)
+            sink_indices = torch.multinomial(t_probs[b].flatten(), n_jumps, replacement=True)
 
-        losses = torch.poisson(s_probs * total_jumps.view(B, 1, 1))
-        gains = torch.poisson(t_probs * total_jumps.view(B, 1, 1))
+            for jump in range(n_jumps):
+                s_u, s_v = divmod(int(src_indices[jump]), N)
+                k_u, k_v = divmod(int(sink_indices[jump]), N)
 
-        xt = xt - losses + gains
-        
-        xt = 0.5 * (xt + xt.transpose(1, 2))
+                xt[b, s_u, s_v] -= 1
+                if s_u != s_v: xt[b, s_v, s_u] -= 1
+                
+                # Add to sink
+                xt[b, k_u, k_v] += 1
+                if k_u != k_v: xt[b, k_v, k_u] += 1
 
     return xt.unsqueeze(0)
 

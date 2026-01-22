@@ -58,15 +58,17 @@ class DiscreteFlowMatcher(nn.Module):
 
     def compute_loss(self, pred_props, target_rates, arrows, arrow_mask, matrix_masks):
         """
-        Calculates NLL loss using the decomposed Source/Sink propensities.
-        matrix_masks: (B, N, N) where True/1 indicates a padded (invalid) entry.
+        Calculates a stable NLL loss using Log-Softmax over raw logits.
         """
-        log_s_prop, log_t_prop = pred_props
-        B, N, _ = log_s_prop.shape
+        s_logits, t_logits = pred_props
+        B, N, _ = s_logits.shape
 
         neg_inf = -1e9
-        masked_s = log_s_prop.masked_fill(matrix_masks.bool(), neg_inf)
-        masked_t = log_t_prop.masked_fill(matrix_masks.bool(), neg_inf)
+        masked_s_logits = s_logits.masked_fill(matrix_masks.bool(), neg_inf)
+        masked_t_logits = t_logits.masked_fill(matrix_masks.bool(), neg_inf)
+
+        log_s_dist = masked_s_logits - torch.logsumexp(masked_s_logits.view(B, -1), dim=1, keepdim=True).view(B, 1, 1)
+        log_t_dist = masked_t_logits - torch.logsumexp(masked_t_logits.view(B, -1), dim=1, keepdim=True).view(B, 1, 1)
 
         src_u = arrows[:, :, 0].long()
         src_v = arrows[:, :, 1].long()
@@ -74,21 +76,16 @@ class DiscreteFlowMatcher(nn.Module):
         sink_v = arrows[:, :, 3].long()
         batch_idx = torch.arange(B, device=self.device).view(B, 1).expand_as(src_u)
 
-        log_p_arrows = log_s_prop[batch_idx, src_u, src_v] + log_t_prop[batch_idx, sink_u, sink_v]
-
-        log_Z_s = torch.logsumexp(masked_s.view(B, -1), dim=1, keepdim=True)
-        log_Z_t = torch.logsumexp(masked_t.view(B, -1), dim=1, keepdim=True)
-
-        nll_all = -(log_p_arrows - log_Z_s - log_Z_t)
+        log_p_arrows = log_s_dist[batch_idx, src_u, src_v] + log_t_dist[batch_idx, sink_u, sink_v]
+        nll_all = -log_p_arrows
 
         if arrow_mask.any():
             loss_active = (nll_all[arrow_mask] * target_rates[arrow_mask]).mean()
         else:
             loss_active = torch.tensor(0.0, device=self.device)
 
-        valid_entries = (~matrix_masks.bool()).float()
-        num_valid = valid_entries.sum() + 1e-6
-        loss_reg = ((log_s_prop**2) * valid_entries).sum() / num_valid + \
-                   ((log_t_prop**2) * valid_entries).sum() / num_valid
+        valid_mask = (~matrix_masks.bool()).float()
+        loss_reg = ((s_logits**2) * valid_mask).sum() / (valid_mask.sum() + 1e-6) + \
+                   ((t_logits**2) * valid_mask).sum() / (valid_mask.sum() + 1e-6)
         
         return loss_active + 0.01 * loss_reg

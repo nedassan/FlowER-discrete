@@ -317,8 +317,5 @@ class AttnEncoderXL(nn.Module):
 
         s_logits = self.source_head(full_pair).squeeze(-1)
         t_logits = self.sink_head(full_pair).squeeze(-1)
-        
-        log_s_prop = torch.nn.functional.logsigmoid(s_logits)
-        log_t_prop = torch.nn.functional.logsigmoid(t_logits)
 
-        return log_s_prop * (~matrix_masks).float(), log_t_prop * (~matrix_masks).float()
+        return s_logits, t_logits

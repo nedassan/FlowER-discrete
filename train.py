@@ -213,9 +213,9 @@ def main(args):
 
             y_emb = model_inner.id2emb(y)
             
-            log_s_prop, log_t_prop = model(y_emb, y_len, xt, t)
+            s_prop, t_prop = model(y_emb, y_len, xt, t)
 
-            loss = flow.compute_loss((log_s_prop, log_t_prop), target_rates, arrows, arrow_mask, train_batch.matrix_masks)
+            loss = flow.compute_loss((s_prop, t_prop), target_rates, arrows, arrow_mask, train_batch.matrix_masks)
 
             (loss / args.accumulation_count).backward()
             losses.append(loss.item())

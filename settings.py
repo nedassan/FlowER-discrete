@@ -42,8 +42,8 @@ class Args:
     post_processing_layers = 1
     enc_heads = 32
     enc_filter_size = 2048
-    dropout = 0.0
-    attn_dropout = 0.0
+    dropout = 0.1
+    attn_dropout = 0.1
     rel_pos = "emb_only"
     shared_attention_layer = 0
     sigma = float(os.environ.get("SIGMA", 0.0))
@@ -55,9 +55,9 @@ class Args:
     beta1 = 0.9
     beta2 = 0.998
     eps = 1e-9
-    weight_decay = 1e-2
+    weight_decay = 5e-2
     warmup_steps = 30000
-    clip_norm = 5.0
+    clip_norm = 1.0
 
 
     epoch = int(os.environ.get("EPOCH", 100))

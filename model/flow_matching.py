@@ -11,7 +11,7 @@ class DiscreteFlowMatcher(nn.Module):
         super().__init__()
         self.args = args
         self.device = args.device
-        self.eps = 1e-4
+        self.eps = 1e-5
 
     def sample_conditional_pt(self, x0, arrows, arrow_lens, t):
         """
@@ -53,39 +53,46 @@ class DiscreteFlowMatcher(nn.Module):
         n_remaining = n_total - k_jumped
         denom = 1.0 - t_expanded + self.eps
         target_rates_all = n_remaining / denom
+        target_rates_all = torch.clamp(target_rates_all, max = 100.0)
         
         return xt, target_rates_all, mask
 
     def compute_loss(self, pred_props, target_rates, arrows, arrow_mask, matrix_masks):
-        """
-        Calculates a stable NLL loss using Log-Softmax over raw logits.
-        """
-        s_logits, t_logits = pred_props
-        B, N, _ = s_logits.shape
+        source_props, sink_props = pred_props
+        B, N, _, _ = source_props.shape
 
-        neg_inf = -1e9
-        masked_s_logits = s_logits.masked_fill(matrix_masks.bool(), neg_inf)
-        masked_t_logits = t_logits.masked_fill(matrix_masks.bool(), neg_inf)
+        ignore_mask = matrix_masks.view(B, -1).eq(0) 
+        valid_entries = ~ignore_mask
 
-        log_s_dist = masked_s_logits - torch.logsumexp(masked_s_logits.view(B, -1), dim=1, keepdim=True).view(B, 1, 1)
-        log_t_dist = masked_t_logits - torch.logsumexp(masked_t_logits.view(B, -1), dim=1, keepdim=True).view(B, 1, 1)
-
-        src_u = arrows[:, :, 0].long()
-        src_v = arrows[:, :, 1].long()
-        sink_u = arrows[:, :, 2].long()
-        sink_v = arrows[:, :, 3].long()
-        batch_idx = torch.arange(B, device=self.device).view(B, 1).expand_as(src_u)
-
-        log_p_arrows = log_s_dist[batch_idx, src_u, src_v] + log_t_dist[batch_idx, sink_u, sink_v]
-        nll_all = -log_p_arrows
-
-        if arrow_mask.any():
-            loss_active = (nll_all[arrow_mask] * target_rates[arrow_mask]).mean()
-        else:
-            loss_active = torch.tensor(0.0, device=self.device)
-
-        valid_mask = (~matrix_masks.bool()).float()
-        loss_reg = ((s_logits**2) * valid_mask).sum() / (valid_mask.sum() + 1e-6) + \
-                   ((t_logits**2) * valid_mask).sum() / (valid_mask.sum() + 1e-6)
+        src_flat = source_props[..., 1].view(B, -1) 
+        snk_flat = sink_props[..., 1].view(B, -1)
         
-        return loss_active + 0.01 * loss_reg
+        src_masked = src_flat.masked_fill(ignore_mask, -1e12)
+        snk_masked = snk_flat.masked_fill(ignore_mask, -1e12)
+
+        log_p_src = torch.log_softmax(src_masked, dim=-1) 
+        log_p_snk = torch.log_softmax(snk_masked, dim=-1)
+
+        src_u, src_v = arrows[:, :, 0].long(), arrows[:, :, 1].long()
+        snk_u, snk_v = arrows[:, :, 2].long(), arrows[:, :, 3].long()
+
+        gt_src_idx = (src_u * N + src_v).clamp(0, N * N - 1)
+        gt_snk_idx = (snk_u * N + snk_v).clamp(0, N * N - 1)
+
+        gt_log_p_src = torch.gather(log_p_src, 1, gt_src_idx)
+        gt_log_p_snk = torch.gather(log_p_snk, 1, gt_snk_idx)
+
+        nll = -(gt_log_p_src + gt_log_p_snk)
+
+        loss_active = torch.tensor(0.0, device=self.device, requires_grad=True)
+        if arrow_mask.any():
+            weights = torch.log1p(torch.clamp(target_rates, max=100.0))
+            loss_active = (nll[arrow_mask] * weights[arrow_mask]).mean()
+            
+        reg_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        if valid_entries.any():
+            reg_loss = 1e-4 * (src_flat[valid_entries]**2 + snk_flat[valid_entries]**2).mean()
+
+        total_loss = loss_active + reg_loss
+        
+        return total_loss, loss_active, reg_loss

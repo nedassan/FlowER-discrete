@@ -19,7 +19,7 @@ from settings import Args
 from model.flow_matching import DiscreteFlowMatcher 
 from utils.train_utils import get_lr, grad_norm, log_rank_0, NoamLR, \
     param_count, param_norm, set_seed, setup_logger, log_args
-from torch.nn.init import xavier_uniform_
+from torch.nn.init import xavier_normal_
 import torch.optim as optim
 
 torch.set_printoptions(precision=4, profile="full", sci_mode=False, linewidth=10000)
@@ -57,7 +57,7 @@ def init_model(args):
         graph_attn_model = AttnEncoderXL(args)
         for p in graph_attn_model.parameters():
             if p.dim() > 1 and p.requires_grad:
-                xavier_uniform_(p)
+                xavier_normal_(p, gain=1e-2)
 
     graph_attn_model.to(args.device)
     flow_model.to(args.device)
@@ -215,10 +215,16 @@ def main(args):
             
             s_prop, t_prop = model(y_emb, y_len, xt, t)
 
-            loss = flow.compute_loss((s_prop, t_prop), target_rates, arrows, arrow_mask, train_batch.matrix_masks)
+            loss, l_active, l_reg = flow.compute_loss((s_prop, t_prop), target_rates, arrows, arrow_mask, train_batch.matrix_masks)
 
             (loss / args.accumulation_count).backward()
             losses.append(loss.item())
+
+            if 'active_losses' not in locals():
+                active_losses, reg_losses = [], []
+
+            active_losses.append(l_active.item())
+            reg_losses.append(l_reg.item())
 
             accum += 1
             if accum == args.accumulation_count:
@@ -228,6 +234,8 @@ def main(args):
 
                 if (total_step % args.log_iter == 0) and (dist.get_rank() == 0):
                     avg_loss = np.mean(losses)
+                    avg_active = np.mean(active_losses)
+                    avg_reg = np.mean(reg_losses)
                     curr_lr = get_lr(optimizer)
                     p_norm = param_norm(model)
                     
@@ -238,6 +246,8 @@ def main(args):
                     
                     wandb.log({
                         "train/loss": avg_loss,
+                        "train/active_loss": avg_active,
+                        "train/reg_loss": avg_reg,
                         "train/grad_norm": g_norm,
                         "train/param_norm": p_norm,
                         "train/lr": curr_lr,

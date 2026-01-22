@@ -270,9 +270,12 @@ class AttnEncoderXL(nn.Module):
             rbf_layers.append(Block(self.rbf.dim))
         self.rbf_linear = torch.nn.Sequential(*rbf_layers)
 
-        self.source_head = nn.Linear(self.d_model + self.rbf.dim, 1)
-        self.sink_head = nn.Linear(self.d_model + self.rbf.dim, 1)
+        self.source_head = nn.Linear(self.d_model + self.rbf.dim, 2)
+        self.sink_head = nn.Linear(self.d_model + self.rbf.dim, 2)
         
+        torch.nn.init.normal_(self.source_head.weight, std=0.01)
+        torch.nn.init.normal_(self.sink_head.weight, std=0.01)
+
         self.softplus = nn.Softplus()
 
     def id2emb(self, ids):
@@ -315,7 +318,7 @@ class AttnEncoderXL(nn.Module):
 
         full_pair = torch.cat([pair_emb, rbf_bond_matrix], dim=-1)
 
-        s_logits = self.source_head(full_pair).squeeze(-1)
-        t_logits = self.sink_head(full_pair).squeeze(-1)
+        source_prop = self.source_head(full_pair)
+        sink_prop = self.sink_head(full_pair)
 
-        return s_logits, t_logits
+        return source_prop, sink_prop

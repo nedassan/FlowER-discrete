@@ -90,3 +90,4 @@ class Args:
     nbest = 3
     max_depth = 15
     chunk_size = 50
+    max_jumps_per_atom = 2

@@ -61,7 +61,9 @@ def expand(args, model, flow, data_loader):
             steps=getattr(args, 'inference_steps', 100), device=args.device
         )
         
-        rounded_states = custom_round(final_states)
+        true_sums = x0_rep.sum(dim=(1, 2))
+        rounded_states = custom_round(final_states, target_sums=true_sums)
+        
         states_per_mol = torch.split(rounded_states, sample_size)
 
         for b_idx in range(B):
@@ -78,6 +80,7 @@ def expand(args, model, flow, data_loader):
 
             for i in range(matrices.shape[0]):
                 pred_be = matrices[i][:num_nodes, :num_nodes]
+                
                 if abs(pred_be.sum() - reac_be.sum()) > 1e-3: continue
 
                 try:

@@ -56,25 +56,39 @@ class DiscreteFlowMatcher(nn.Module):
         
         return xt, target_rates_all, mask
 
-    def compute_loss(self, pred_props, target_rates, arrows, arrow_mask):
+    def compute_loss(self, pred_props, target_rates, arrows, arrow_mask, matrix_masks):
+        """
+        Calculates NLL loss using the decomposed Source/Sink propensities.
+        matrix_masks: (B, N, N) where True/1 indicates a padded (invalid) entry.
+        """
         log_s_prop, log_t_prop = pred_props
-        B = log_s_prop.size(0)
-        
+        B, N, _ = log_s_prop.shape
+
+        neg_inf = -1e9
+        masked_s = log_s_prop.masked_fill(matrix_masks.bool(), neg_inf)
+        masked_t = log_t_prop.masked_fill(matrix_masks.bool(), neg_inf)
+
         src_u = arrows[:, :, 0].long()
         src_v = arrows[:, :, 1].long()
         sink_u = arrows[:, :, 2].long()
         sink_v = arrows[:, :, 3].long()
-
         batch_idx = torch.arange(B, device=self.device).view(B, 1).expand_as(src_u)
-        
-        log_pred_rates = log_s_prop[batch_idx, src_u, src_v] + log_t_prop[batch_idx, sink_u, sink_v]
-        pred_rates = torch.exp(log_pred_rates)
+
+        log_p_arrows = log_s_prop[batch_idx, src_u, src_v] + log_t_prop[batch_idx, sink_u, sink_v]
+
+        log_Z_s = torch.logsumexp(masked_s.view(B, -1), dim=1, keepdim=True)
+        log_Z_t = torch.logsumexp(masked_t.view(B, -1), dim=1, keepdim=True)
+
+        nll_all = -(log_p_arrows - log_Z_s - log_Z_t)
 
         if arrow_mask.any():
-            loss_active = ((pred_rates[arrow_mask] - target_rates[arrow_mask])**2).mean()
+            loss_active = (nll_all[arrow_mask] * target_rates[arrow_mask]).mean()
         else:
             loss_active = torch.tensor(0.0, device=self.device)
 
-        loss_bg = (log_s_prop**2).mean() + (log_t_prop**2).mean()
+        valid_entries = (~matrix_masks.bool()).float()
+        num_valid = valid_entries.sum() + 1e-6
+        loss_reg = ((log_s_prop**2) * valid_entries).sum() / num_valid + \
+                   ((log_t_prop**2) * valid_entries).sum() / num_valid
         
-        return loss_active + 0.01 * loss_bg
+        return loss_active + 0.01 * loss_reg

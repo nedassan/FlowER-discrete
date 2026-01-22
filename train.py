@@ -215,8 +215,8 @@ def main(args):
             
             s_prop, t_prop = model(y_emb, y_len, xt, t)
 
-            loss = flow.compute_loss((s_prop, t_prop), target_rates, arrows, arrow_mask)
-            
+            loss = flow.compute_loss(vt, target_rates, arrows, arrow_mask, train_batch.matrix_masks)
+
             (loss / args.accumulation_count).backward()
             losses.append(loss.item())
 

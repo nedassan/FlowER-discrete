@@ -6,18 +6,20 @@ from utils.data_utils import ReactionDataset, BEmatrix_to_mol, ps
 import torch.distributed as dist
 from train import init_model, init_loader
 from utils.train_utils import log_rank_0, setup_logger, log_args
-from eval_multiGPU import custom_round, predict_batch
+from eval_multiGPU import custom_round, tau_leaping_batch, redist_fix
 from settings import Args
 from collections import defaultdict
 import networkx as nx
 import pickle
 import torch.multiprocessing as mp
 import time
-
 import warnings
+
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 def standardize_smiles(mol):
+    if mol is None: return "None"
+    [a.SetAtomMapNum(0) for a in mol.GetAtoms()]
     return Chem.MolToSmiles(mol, isomericSmiles=False, allHsExplicit=True)
 
 def select(args, frontiers_dict, graph_list):
@@ -26,77 +28,68 @@ def select(args, frontiers_dict, graph_list):
         graph, root, _ = graph_list[g_idx]
         rank_frontiers = {}
         for frontier in frontiers:
-            min_sequences_rank = np.inf
+            probs_list = []
             for path in nx.all_simple_paths(graph, root, frontier):
-                max_depth = max(graph.nodes[root]['depth'], len(path))
-                graph.nodes[root]['depth'] = max_depth
                 edges = list(nx.utils.pairwise(path))
-                ranks = [graph.get_edge_data(u, v)['rank'] for u, v in edges]
                 probs = [graph.get_edge_data(u, v)['count'] / args.sample_size for u, v in edges]
-                cum_prob = np.prod(probs)
-                max_topk_within_one_seq = max(ranks)
-                min_sequences_rank = min(max_topk_within_one_seq, min_sequences_rank)
-
-            rank_frontiers[frontier] = -cum_prob
-        rank_frontiers = sorted(rank_frontiers.items(), key=lambda x:x[1])[:args.beam_size]
-
-        filtered_frontiers_dict[g_idx] = list(dict(rank_frontiers).keys())
+                probs_list.append(np.prod(probs))
+            
+            rank_frontiers[frontier] = -max(probs_list) if probs_list else 0
+        
+        sorted_frontiers = sorted(rank_frontiers.items(), key=lambda x: x[1])[:args.beam_size]
+        filtered_frontiers_dict[g_idx] = [f[0] for f in sorted_frontiers]
     return filtered_frontiers_dict
-
 
 def expand(args, model, flow, data_loader):
     sample_size = args.sample_size
-
     overall_dict = {}
+
     for batch_idx, data_batch in enumerate(data_loader):
         data_batch.to(args.device)
-        src_data_indices = data_batch.src_data_indices
         y = data_batch.src_token_ids
         y_len = data_batch.src_lens
         x0 = data_batch.src_matrices
-        # matrix_masks = data_batch.matrix_masks
-        src_smiles_list = data_batch.src_smiles_list
+        src_smis = data_batch.src_smiles_list
+        B, N, _ = x0.shape
 
-        batch_size, n, n = x0.shape
+        y_emb_rep = model.id2emb(y).repeat_interleave(sample_size, dim=0)
+        y_len_rep = y_len.repeat_interleave(sample_size, dim=0)
+        x0_rep = x0.repeat_interleave(sample_size, dim=0)
 
-        if (batch_size*n*n) <= 5*360*360:
-            traj_list = predict_batch(args, batch_idx, data_batch, model, flow, 1)
-        else:
-            traj_list = predict_batch(args, batch_idx, data_batch, model, flow, 2)
-
-        last_step = traj_list[-1]
+        final_states = tau_leaping_batch(
+            model, y_emb_rep, y_len_rep, x0_rep, 
+            steps=getattr(args, 'inference_steps', 100), device=args.device
+        )
         
-        product_BE_matrices = custom_round(last_step)
-        product_BE_matrices_batch = torch.split(product_BE_matrices, sample_size)
+        rounded_states = custom_round(final_states)
+        states_per_mol = torch.split(rounded_states, sample_size)
 
-        for idx in range(batch_size):
-            reac_smi, product_BE_matrices = \
-                src_smiles_list[idx], product_BE_matrices_batch[idx]
-
+        for b_idx in range(B):
+            reac_smi = src_smis[b_idx]
             reac_mol = Chem.MolFromSmiles(reac_smi, ps)
-            matrices, counts = torch.unique(product_BE_matrices, dim=0, return_counts=True)
+            mol_samples = states_per_mol[b_idx]
+            
+            matrices, counts = torch.unique(mol_samples, dim=0, return_counts=True)
             matrices, counts = matrices.cpu().numpy(), counts.cpu().numpy()
             
             pred_smis_dict = defaultdict(int)
-            for i in range(matrices.shape[0]): 
-                pred_prod_be_matrix, count = matrices[i], counts[i]
-                num_nodes = y_len[idx]
-                pred_prod_be_matrix = pred_prod_be_matrix[:num_nodes, :num_nodes]
-                reac_be_matrix = x0[idx][:num_nodes, :num_nodes].detach().cpu().numpy()
+            num_nodes = y_len[b_idx].item()
+            reac_be = x0[b_idx][:num_nodes, :num_nodes].cpu().numpy()
 
-                assert pred_prod_be_matrix.shape == reac_be_matrix.shape, "pred and reac not the same shape"
-                
+            for i in range(matrices.shape[0]):
+                pred_be = matrices[i][:num_nodes, :num_nodes]
+                if abs(pred_be.sum() - reac_be.sum()) > 1e-3: continue
+
                 try:
-                    pred_mol = BEmatrix_to_mol(reac_mol, pred_prod_be_matrix)
-                    pred_smi = standardize_smiles(pred_mol)
-                    pred_mol = Chem.MolFromSmiles(pred_smi, ps)
-                    pred_smi = standardize_smiles(pred_mol)
-                    pred_smis_dict[pred_smi] += count
-                except: pass
+                    pred_be = redist_fix(pred_be, reac_smi, reac_be)
+                    pred_mol = BEmatrix_to_mol(reac_mol, pred_be)
+                    smi = standardize_smiles(pred_mol)
+                    if smi != "None":
+                        pred_smis_dict[smi] += counts[i]
+                except: continue
 
-            pred_smis_tuples = sorted(pred_smis_dict.items(), key=lambda x: x[1], reverse=True)
-            pred_smis_dict = dict(pred_smis_tuples[:args.nbest])
-            overall_dict[reac_smi] = pred_smis_dict
+            top_preds = sorted(pred_smis_dict.items(), key=lambda x: x[1], reverse=True)[:args.nbest]
+            overall_dict[reac_smi] = dict(top_preds)
 
     return overall_dict
 
@@ -107,208 +100,115 @@ def reactant_process(smi):
         for idx, atom in enumerate(mol.GetAtoms()):
             atom.SetAtomMapNum(idx+1)
         return Chem.MolToSmiles(mol, isomericSmiles=False, allHsExplicit=True)
-    except:
-        print(smi)
-        raise
+    except: return smi
 
 def clean(smi):
-    # try:
     mol = Chem.MolFromSmiles(smi, sanitize=False)
+    if mol is None: return smi
     mol = Chem.RemoveHs(mol)
     [atom.SetAtomMapNum(0) for atom in mol.GetAtoms()]
     return Chem.MolToSmiles(mol, isomericSmiles=False)
 
 def beam_search(args, model, flow, frontiers_dict, graph_list):
-    smiles_list = [frontier for frontiers in frontiers_dict.values() for frontier in frontiers]
-    if len(smiles_list) == 0: return
-    # log_rank_0(f"Current Depth: {[graph.nodes[root]['depth'] for graph, root, _ in graph_list]}")
-    exclude_gidx = [g_idx for g_idx, (graph, root, _) in enumerate(graph_list) 
-                    if graph.nodes[root]['depth'] >= args.max_depth]
+    smiles_list = [f for frontiers in frontiers_dict.values() for f in frontiers]
+    if not smiles_list: return
+    
+    exclude_gidx = [idx for idx, (g, r, _) in enumerate(graph_list) 
+                    if g.nodes[r]['depth'] >= args.max_depth]
 
     test_dataset = ReactionDataset(args, smiles_list, reactant_only=True)
     try:
-        test_loader = init_loader(args, test_dataset,
-                                batch_size=args.test_batch_size,
-                                shuffle=False, epoch=None, use_sort=False)
-    except Exception as e:
-        print(e)
-        return
+        test_loader = init_loader(args, test_dataset, batch_size=args.test_batch_size, 
+                                shuffle=False, use_sort=False)
+    except: return
     
     overall_dict = expand(args, model, flow, test_loader)
     new_frontiers_dict = defaultdict(list)
-
-    existing_reactions = {g_idx: {} for g_idx in frontiers_dict.keys()}
+    
     for g_idx, frontiers in frontiers_dict.items():
         if g_idx in exclude_gidx: continue
-        existing_reaction = existing_reactions[g_idx]
-        graph, _, _ = graph_list[g_idx]
+        graph, root, _ = graph_list[g_idx]
         for frontier in frontiers:
-            clean_frontier = clean(frontier)
-            try: product_info_dict = overall_dict[frontier]
-            except: continue
-            for rank, (product, count) in enumerate(product_info_dict.items()):
-                try: clean_product = clean(product)
-                except: continue
-                if (clean_frontier, clean_product) in existing_reaction:
-                    stored_frontier, stored_product = existing_reaction[(clean_frontier, clean_product)]
-                    parent_current = list(graph.predecessors(frontier))
-                    parent_stored = list(graph.predecessors(stored_frontier))
+            if frontier not in overall_dict: continue
+            for rank, (product, count) in enumerate(overall_dict[frontier].items()):
+                if not graph.has_node(product):
+                    graph.add_node(product)
+                    new_frontiers_dict[g_idx].append(product)
+                graph.add_edge(frontier, product, rank=rank, count=count)
 
-                    if parent_current == parent_stored:
-                        graph[stored_frontier][stored_product]["count"] += count
-                    
-                else:
-                    if not graph.has_node(product):
-                        new_frontiers_dict[g_idx].append(product)
-                    graph.add_edge(frontier, product, rank=rank, count=count)
-                    existing_reaction[(clean_frontier, clean_product)] = (frontier, product)
-                    
-
-    filtered_frontiers_dict = select(args, new_frontiers_dict, graph_list)
-    beam_search(args, model, flow, filtered_frontiers_dict, graph_list)
-
-
-def group_lists(lists, group_size):
-    result = []
-    for i in range(0, len(lists), group_size):
-        chunk = lists[i:i + group_size]
-        result.append(tuple(chunk))
-    return result
-
-import signal
-import os
-
-def init_process_killer():
-    global processes
-    processes = []
-    
-    def signal_handler(sig, frame):
-        print('\nTerminating all processes...')
-        for p in processes:
-            if p.is_alive():
-                p.terminate()
-                p.join()  # Wait for process to finish
-        os._exit(0)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    return processes
+    filtered_frontiers = select(args, new_frontiers_dict, graph_list)
+    beam_search(args, model, flow, filtered_frontiers, graph_list)
 
 def worker(rank, args, chunk, chunk_idx, lock, queue):
-    """Worker function that runs on each GPU"""
     torch.cuda.set_device(rank)
     device = torch.device(f'cuda:{rank}')
     args.device = device
-    args.local_rank = -1 
     
     checkpoint = os.path.join(args.model_path, args.model_name)
-    state = torch.load(checkpoint, weights_only=False, map_location=device)
-    pretrain_args = state["args"]
-    pretrain_args.load_from = None
-    pretrain_args.device = device
-    pretrain_args.local_rank = -1
-    
-    pretrain_state_dict = state["state_dict"]
-    attn_model, flow, _ = init_model(pretrain_args)
-    
-    if hasattr(attn_model, "module"):
-        attn_model = attn_model.module
-    
-    pretrain_state_dict = {k.replace("module.", ""): v for k, v in pretrain_state_dict.items()}
-    attn_model.load_state_dict(pretrain_state_dict)
+    state = torch.load(checkpoint, map_location=device)
+    model, flow, _ = init_model(state["args"])
+    sd = {k.replace("module.", ""): v for k, v in state["state_dict"].items()}
+    model.load_state_dict(sd)
+    model.eval()
     
     graph_list = []
     frontiers_dict = defaultdict(list)
     for idx, line in enumerate(chunk):
-        if ">>" in line:
-            ori_reactant = line.strip().split(">>")[0]
-            products = line.strip().split(">>")[1].split("|")
-            products = [Chem.MolToSmiles(Chem.MolFromSmiles(smi)) for smi in products]
-        else:
-            ori_reactant = line.strip()
-            products = []
-        reactant = reactant_process(ori_reactant)
+        parts = line.strip().split(">>")
+        ori_reac = parts[0]
+        targets = parts[1].split("|") if len(parts) > 1 else []
+        targets = [standardize_smiles(Chem.MolFromSmiles(s)) for s in targets]
+        
+        reactant = reactant_process(ori_reac)
         graph = nx.DiGraph()
         graph.add_node(reactant, depth=1)
-        graph_list.append((graph, reactant, (ori_reactant, products)))
+        graph_list.append((graph, reactant, (ori_reac, targets)))
         frontiers_dict[idx].append(reactant)
     
-    beam_search(args, attn_model, flow, frontiers_dict, graph_list)
-
-    lock.acquire()
-    try:
-        queue.put((rank, chunk_idx, graph_list))
-    finally:
-        lock.release()
+    beam_search(args, model, flow, frontiers_dict, graph_list)
+    queue.put((rank, chunk_idx, graph_list))
 
 def check_if_successful(graph, products):
-    nodes_with_loops = list(nx.nodes_with_selfloops(graph))
-    achieved_products = set()
+    achieved = set()
+    target_set = set(products)
     for node in graph.nodes():
-        node_in_products = set(clean(node).split('.')) & set(products)
-        if node_in_products and node in nodes_with_loops:
-            achieved_products.update(node_in_products)
-    return achieved_products
+        node_parts = set(clean(node).split('.'))
+        match = node_parts & target_set
+        if match: achieved.update(match)
+    return achieved
 
 def main_multi_gpu(args):
-    start = time.time()
-    global processes
-    processes = init_process_killer()
-
     world_size = torch.cuda.device_count()
-    log_rank_0(f"Found {world_size} GPUs")
-    
-    with open(args.test_path, 'r') as test_o:
-        test_smiles_list = test_o.readlines()
+    with open(args.test_path, 'r') as f:
+        test_smiles_list = f.readlines()
     
     chunk_size = args.chunk_size // world_size
     chunks = [test_smiles_list[i:i + chunk_size] for i in range(0, len(test_smiles_list), chunk_size)]
-
-    group_chunks = group_lists(chunks, world_size)
-    log_rank_0(f"Number of group chunks: {len(group_chunks)}")
-
+    
     os.makedirs(args.result_path, exist_ok=True)
     lock = mp.Lock()
     q = mp.Queue()
+    
     chunk_idx = 0
-    for group_chunk_id, group_chunk in enumerate(group_chunks):        
-        log_rank_0(f"Group Chunk-{group_chunk_id} called:")
-        all_results = []
+    for g_id, group in enumerate([chunks[i:i+world_size] for i in range(0, len(chunks), world_size)]):
         processes = []
-        for gpu_idx, chunk in enumerate(group_chunk):
+        for gpu_idx, chunk in enumerate(group):
             p = mp.Process(target=worker, args=(gpu_idx, args, chunk, chunk_idx, lock, q))
             p.start()
             processes.append(p)
-            time.sleep(1)
             chunk_idx += 1
-
-        outputs = []
+        
+        all_results = []
         for _ in processes:
-            output = q.get(timeout=1000)
-            if output is None: continue
-            outputs.append(output)
-        outputs  = sorted(outputs, key=lambda x:x[0])
-        for output in outputs:
-            _, output_chunk_idx, graph_list = output
-            for beam_idx, (graph, root, (reactant, products)) in enumerate(graph_list):
-                check = check_if_successful(graph, products)
-                log_rank_0(f"Beam Search Results {beam_idx}: {len(check)}/{len(products)} - {check}")
-                all_results.append((graph, root, (reactant, products), check))
-
-        for p in processes:
-            p.join()
-
-        saving_file = os.path.join(args.result_path, f'result_chunk_{group_chunk_id}.pickle')
-        with open(saving_file, "wb") as f_out:
+            res = q.get()
+            for b_idx, (g, r, (orig, targets)) in enumerate(res[2]):
+                achieved = check_if_successful(g, targets)
+                all_results.append((g, r, (orig, targets), achieved))
+        
+        for p in processes: p.join()
+        with open(os.path.join(args.result_path, f'res_gpu_chunk_{g_id}.pickle'), "wb") as f_out:
             pickle.dump(all_results, f_out)
 
-        log_rank_0(f"---- Time used: {(time.time() - start):.2f}s ----")
-
-    log_rank_0("Done!")
-
 if __name__ == "__main__":
-    mp.set_start_method('spawn')
-    
-    args = Args
-    logger = setup_logger(args, "beam")
-    log_args(args, 'evaluation')
-    main_multi_gpu(args)
+    mp.set_start_method('spawn', force=True)
+    main_multi_gpu(Args)

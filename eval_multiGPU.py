@@ -3,6 +3,7 @@ import glob
 import datetime
 import torch
 import numpy as np
+import torch.nn as nn
 from rdkit import Chem
 from utils.data_utils import ReactionDataset, BEmatrix_to_mol, ps
 from utils.rounding import saferound_tensor
@@ -12,348 +13,147 @@ from utils.train_utils import log_rank_0, setup_logger, log_args
 from settings import Args
 from collections import defaultdict
 import time
-import iteround
-
-ps = Chem.SmilesParserParams()
-ps.removeHs = False
-ps.sanitize = True
 
 def is_sym(a):
     return (a.transpose(1, 0) == a).all()
 
+def y_len_to_mask(y_len, N):
+    """Creates a (B, N*N) mask where padding is True."""
+    B = y_len.shape[0]
+    node_range = torch.arange(N, device=y_len.device).unsqueeze(0)
+    node_mask = node_range >= y_len.unsqueeze(1) 
+    matrix_mask = node_mask.unsqueeze(1) | node_mask.unsqueeze(2)
+    return matrix_mask.view(B, -1)
+
 def redist_fix(pred_matrix, reac_smi, reac_be_matrix):
-    pred_electron_sum = np.zeros([len(pred_matrix)])
-    for i in range(len(pred_matrix)):
-        pred_electron_sum[i] = \
-        np.sum(pred_matrix[i, :]) + np.sum(pred_matrix[:, i]) - pred_matrix[i, i]
-
-    reac_electron_sum = np.zeros([len(reac_be_matrix)])
-    for i in range(len(reac_be_matrix)):
-        reac_electron_sum[i] = \
-        np.sum(reac_be_matrix[i, :]) + np.sum(reac_be_matrix[:, i]) - reac_be_matrix[i, i]
-
+    """Ensures atom-level electron conservation via lone-pair adjustment."""
+    pred_electron_sum = np.sum(pred_matrix, axis=1) + np.sum(pred_matrix, axis=0) - np.diag(pred_matrix)
+    reac_electron_sum = np.sum(reac_be_matrix, axis=1) + np.sum(reac_be_matrix, axis=0) - np.diag(reac_be_matrix)
     diff = reac_electron_sum - pred_electron_sum
-
-    if np.sum(diff) == 0:
-        pred_matrix[np.diag_indices_from(pred_matrix)] += diff
-
+    if np.isclose(np.sum(diff), 0, atol=1e-5):
+        diag_idx = np.diag_indices_from(pred_matrix)
+        pred_matrix[diag_idx] += diff
     return pred_matrix
 
-def redistribute_round(x):
-    # For discrete model, x should already be integer, but this acts as a safeguard
-    # against any floating point drift if present.
-    rounded = saferound_tensor(x, places=0, strategy="difference")
-    return rounded
-
-def custom_round(x):
-    output = []
-    for i in range(x.shape[0]):
-        try: output.append(redistribute_round(x[i]))
-        except: output.append(torch.round(x[i]))
-    return torch.stack(output)
-
 def standardize_smiles(mol):
+    if mol is None: return "None"
     [a.SetAtomMapNum(0) for a in mol.GetAtoms()]
     return Chem.MolToSmiles(mol, isomericSmiles=False, allHsExplicit=True)
 
-def split_number(number, num_parts):
-    if number % num_parts != 0:
-        raise ValueError("The number cannot be evenly divided into the specified number of parts.")
-    return [number // num_parts] * num_parts
-
 def tau_leaping_batch(model, y_emb, y_len, x0, steps=100, device='cuda'):
     """
-    Performs joint factorized Tau-Leaping inference to ensure mass conservation.
+    Joint factorized Tau-Leaping. 
+    Predicts electron jumps while respecting molecular boundaries.
     """
     B, N, _ = x0.shape
     xt = x0.clone()
     dt = 1.0 / steps
+    mask = y_len_to_mask(y_len, N)
     
     time_grid = torch.linspace(0, 1, steps + 1, device=device)
 
     for i in range(steps):
-        t = time_grid[i]
-        t_batch = torch.full((B,), t, device=device)
-
-        s_logits, t_logits = model(y_emb, y_len, xt, t_batch)
+        t = torch.full((B,), time_grid[i], device=device)
+        
+        s_logits, t_logits = model(y_emb, y_len, xt, t)
 
         s_logits = 0.5 * (s_logits + s_logits.transpose(1, 2))
         t_logits = 0.5 * (t_logits + t_logits.transpose(1, 2))
+        
+        s_flat = s_logits[..., 1].view(B, -1).masked_fill(mask, -1e12)
+        t_flat = t_logits[..., 1].view(B, -1).masked_fill(mask, -1e12)
 
-        s_probs = torch.softmax(s_logits.view(B, -1), dim=-1).view(B, N, N)
-        t_probs = torch.softmax(t_logits.view(B, -1), dim=-1).view(B, N, N)
-
-        sum_s = torch.exp(s_logits).sum(dim=(1, 2))
-        sum_t = torch.exp(t_logits).sum(dim=(1, 2))
+        sum_s = torch.logsumexp(s_flat, dim=-1).exp()
+        sum_t = torch.logsumexp(t_flat, dim=-1).exp()
         global_rate = sum_s * sum_t
         
         total_jumps = torch.poisson(global_rate * dt)
+        s_probs = torch.softmax(s_flat, dim=-1)
+        t_probs = torch.softmax(t_flat, dim=-1)
 
         for b in range(B):
             n_jumps = int(total_jumps[b].item())
             if n_jumps == 0: continue
 
-            src_indices = torch.multinomial(s_probs[b].flatten(), n_jumps, replacement=True)
-            sink_indices = torch.multinomial(t_probs[b].flatten(), n_jumps, replacement=True)
+            src_idx = torch.multinomial(s_probs[b], n_jumps, replacement=True)
+            snk_idx = torch.multinomial(t_probs[b], n_jumps, replacement=True)
 
-            for jump in range(n_jumps):
-                s_u, s_v = divmod(int(src_indices[jump]), N)
-                k_u, k_v = divmod(int(sink_indices[jump]), N)
+            for j in range(n_jumps):
+                s_u, s_v = divmod(int(src_idx[j]), N)
+                k_u, k_v = divmod(int(snk_idx[j]), N)
 
                 xt[b, s_u, s_v] -= 1
                 if s_u != s_v: xt[b, s_v, s_u] -= 1
-                
-                # Add to sink
                 xt[b, k_u, k_v] += 1
                 if k_u != k_v: xt[b, k_v, k_u] += 1
 
-    return xt.unsqueeze(0)
-
-start = time.time()
-def predict_batch(args, batch_idx, data_batch, model, flow, split, rand_matrix=None):
-    src_data_indices = data_batch.src_data_indices
-    y = data_batch.src_token_ids
-    y_len = data_batch.src_lens
-    x0 = data_batch.src_matrices
-    matrix_masks = data_batch.matrix_masks
-
-    batch_size, n, n = x0.shape
-    
-    log_rank_0(f"Batch idx: {batch_idx}, batch_shape {batch_size, n, n} {(time.time() - start): .2f}s")
-    
-    SAMPLE_BATCH = args.sample_size
-    split_sample_batches = split_number(SAMPLE_BATCH, split)
-    
-    big_traj_list = []
-    
-    inference_steps = getattr(args, 'inference_steps', 100)
-
-    for sample_size in split_sample_batches:
-        # src_data_indices = src_data_indices.repeat_interleave(sample_size, dim=0) # Unused var
-        x0_repeated = x0.repeat_interleave(sample_size, dim=0)
-
-        xt = x0_repeated.clone() 
-        xt = xt.masked_fill(~(matrix_masks.repeat_interleave(sample_size, dim=0).bool()), 0)
-
-        y_repeated = y.repeat_interleave(sample_size, dim=0)
-        y_emb_repeated = model.id2emb(y_repeated)
-        y_len_batch_repeated = y_len.repeat_interleave(sample_size, dim=0)
-
-        final_state = tau_leaping_batch(
-            model, 
-            y_emb_repeated, 
-            y_len_batch_repeated, 
-            xt, 
-            steps=inference_steps, 
-            device=args.device
-        )
-        
-        big_traj_list.append((final_state.detach().cpu(), sample_size))
-
-    all_traj_list = []
-    for bs in range(batch_size):
-        for traj_list, sample_size in big_traj_list:
-            all_traj_list.append(traj_list[:, bs*sample_size:(bs+1)*sample_size])
-            
-    traj_list = torch.concat(all_traj_list, dim=1) 
-    
-    return traj_list
+    return xt
 
 def get_predictions(args, model, flow, data_loader, iter_count=np.inf, write_o=None):
     accuracy = []
     model.eval()
+    
     with torch.no_grad():
-        log_rank_0('Start Tau-Leaping Prediction...')
-        if dist.get_rank() == 0:
-            inferenced_indexes = set()
+        log_rank_0('Start Tau-Leaping Evaluation...')
+        inferenced_indexes = set()
 
         for batch_idx, data_batch in enumerate(data_loader):
             if batch_idx >= iter_count: break
             data_batch.to(args.device)
 
-            src_data_indices = data_batch.src_data_indices
             x0 = data_batch.src_matrices
             y_len = data_batch.src_lens
-            batch_size, n, n = x0.shape
-            src_smiles_list = data_batch.src_smiles_list
-            tgt_smiles_list = data_batch.tgt_smiles_list
+            y_emb = model.id2emb(data_batch.src_token_ids)
+            B, N, _ = x0.shape
 
-            if (batch_size*n*n) <= 15*130*130:
-                traj_list = predict_batch(args, batch_idx, data_batch, model, flow, 1)
+            sample_size = getattr(args, 'sample_size', 1)
+            y_emb_rep = y_emb.repeat_interleave(sample_size, dim=0)
+            y_len_rep = y_len.repeat_interleave(sample_size, dim=0)
+            x0_rep = x0.repeat_interleave(sample_size, dim=0)
+
+            xt_final = tau_leaping_batch(model, y_emb_rep, y_len_rep, x0_rep, 
+                                        steps=getattr(args, 'inference_steps', 100), 
+                                        device=args.device)
+
+            if dist.is_initialized():
+                res = (data_batch.src_data_indices, xt_final.cpu(), x0.cpu(), 
+                       y_len.cpu(), data_batch.src_smiles_list, data_batch.tgt_smiles_list)
+                gathered = [None] * dist.get_world_size()
+                dist.all_gather_object(gathered, res)
             else:
-                traj_list = predict_batch(args, batch_idx, data_batch, model, flow, 2)
+                gathered = [(data_batch.src_data_indices, xt_final.cpu(), x0.cpu(), 
+                            y_len.cpu(), data_batch.src_smiles_list, data_batch.tgt_smiles_list)]
 
-            if torch.distributed.is_initialized() and dist.get_world_size() > 1:
-                gathered_results = [None for _ in range(dist.get_world_size())]
-                dist.gather_object(
-                    (src_data_indices, traj_list, x0, y_len, src_smiles_list, tgt_smiles_list),
-                    gathered_results if dist.get_rank() == 0 else None,
-                    dst=0
-                )
-            else:
-                gathered_results = [(src_data_indices, traj_list, x0, y_len, src_smiles_list, tgt_smiles_list)]
+            if dist.get_rank() != 0: continue
 
-            if dist.get_rank() > 0:
-                continue
-
-            for result in gathered_results:
-                src_data_indices, traj_list, x0, y_len, src_smiles_list, tgt_smiles_list = result
-                batch_size, n, n = x0.shape
-
-                last_step = traj_list[-1] 
+            for batch_res in gathered:
+                indices, xt_list, x0_list, lens, src_smis, tgt_smis = batch_res
                 
-                product_BE_matrices = custom_round(last_step)
-                product_BE_matrices_batch = torch.split(product_BE_matrices, args.sample_size)
+                for b in range(len(indices)):
+                    d_idx = int(indices[b])
+                    if d_idx in inferenced_indexes: continue
+                    inferenced_indexes.add(d_idx)
 
-                for idx in range(batch_size):
-                    reac_smi, product_smi, product_BE_matrices = \
-                        src_smiles_list[idx], tgt_smiles_list[idx], product_BE_matrices_batch[idx]
+                    correct_found = False
+                    reac_mol = Chem.MolFromSmiles(src_smis[b], ps)
+                    gold_smi = standardize_smiles(Chem.MolFromSmiles(tgt_smis[b], ps))
                     
-                    data_idx = int(src_data_indices[idx].detach().cpu())
-                    if data_idx in inferenced_indexes: continue
-                    else: inferenced_indexes.add(data_idx)
-
-                    reac_mol = Chem.MolFromSmiles(reac_smi, ps)
-                    # prod_mol = Chem.MolFromSmiles(product_smi, ps) # Unused
-
-                    tgt_mol = Chem.MolFromSmiles(product_smi, ps)
-                    tgt_smiles = standardize_smiles(tgt_mol)
-
-                    matrices, counts = torch.unique(product_BE_matrices, dim=0, return_counts=True)
-                    matrices, counts = matrices.cpu().numpy(), counts.cpu().numpy()
-
-                    not_sym = 0
-
-                    correct = wrong_smi_conserved = wrong_smi_non_conserved = 0
-                    no_smi_conserved = no_smi_non_conserved = 0
-
-                    pred_smi_dict = defaultdict(int)
-                    pred_conserved_dict = defaultdict(bool)
+                    samples = xt_list[b*sample_size : (b+1)*sample_size]
                     
-                    for i in range(matrices.shape[0]):
-                        pred_prod_be_matrix, count = matrices[i], counts[i] 
-                        num_nodes = y_len[idx]
-                        pred_prod_be_matrix = pred_prod_be_matrix[:num_nodes, :num_nodes]
-                        reac_be_matrix = x0[idx][:num_nodes, :num_nodes].detach().cpu().numpy()
-
-                        pred_prod_be_matrix = redist_fix(pred_prod_be_matrix, reac_smi, reac_be_matrix)
-
-                        assert pred_prod_be_matrix.shape == reac_be_matrix.shape, "pred and reac not the same shape"
+                    for s_idx in range(sample_size):
+                        pred_be = samples[s_idx][:lens[b], :lens[b]].numpy()
+                        reac_be = x0_list[b][:lens[b], :lens[b]].numpy()
                         
-                        if not is_sym(pred_prod_be_matrix):
-                            not_sym += 1
-
+                        pred_be = redist_fix(pred_be, src_smis[b], reac_be)
+                        
                         try:
-                            pred_mol = BEmatrix_to_mol(reac_mol, pred_prod_be_matrix)
-                            pred_smi = standardize_smiles(pred_mol)
-                            
-                            pred_mol = Chem.MolFromSmiles(pred_smi, ps)
-                            pred_smi = standardize_smiles(pred_mol)
-
-                            if pred_smi == tgt_smiles:
-                                correct += count
-                                pred_smi_dict[pred_smi] += count
-                                pred_conserved_dict[pred_smi] = True
-                            
-                            elif abs(pred_prod_be_matrix.sum() - reac_be_matrix.sum()) < 1e-3: 
-                                wrong_smi_conserved += count
-                                pred_smi_dict[pred_smi] += count
-                                pred_conserved_dict[pred_smi] = True
-                            else: 
-                                wrong_smi_non_conserved += count
-                        except:
-                            if abs(pred_prod_be_matrix.sum() - reac_be_matrix.sum()) < 1e-3:
-                                no_smi_conserved += count
-                            else:
-                                no_smi_non_conserved += count
+                            pred_mol = BEmatrix_to_mol(reac_mol, pred_be)
+                            if standardize_smiles(pred_mol) == gold_smi:
+                                correct_found = True
+                                break
+                        except: continue
                     
-                    metric = [correct, wrong_smi_conserved, wrong_smi_non_conserved, no_smi_conserved, no_smi_non_conserved]
-                    predictions = [(smi, pred_smi_dict[smi], pred_conserved_dict[smi]) for smi in pred_smi_dict]
-                    if write_o is not None: 
-                        write_o.write(f"{metric}|{not_sym}|{predictions}\n")
-                        write_o.flush()
-                    accuracy.append(metric)
+                    accuracy.append([1 if correct_found else 0])
+                    if write_o: write_o.write(f"{d_idx}|{1 if correct_found else 0}\n")
 
     return accuracy
-
-
-def main(args):
-    args.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    device = args.device
-    if args.local_rank != -1:
-        dist.init_process_group(backend=args.backend, init_method='env://', timeout=datetime.timedelta(0, 7200))
-        torch.cuda.set_device(args.local_rank)
-        torch.backends.cudnn.benchmark = True
-
-    if args.do_validate:
-        phase = "valid"
-        checkpoints = glob.glob(os.path.join(args.model_path, "*.pt"))
-        checkpoints = sorted(
-            checkpoints,
-            key=lambda ckpt: int(ckpt.split(".")[-2].split("_")[-1]),
-            reverse=True
-        )
-        assert len(args.steps2validate) > 1, "Nothing to validate on"
-        checkpoints = [ckpt for ckpt in checkpoints 
-            if ckpt.split(".")[-2].split("_")[0] in args.steps2validate] 
-    else:
-        phase = "test"
-        checkpoints = [os.path.join(args.model_path, args.model_name)]
-
-    for ckpt_i, checkpoint in enumerate(checkpoints):
-        state = torch.load(checkpoint, weights_only=False, map_location=device)
-        pretrain_args = state["args"]
-        pretrain_args.load_from = None
-        pretrain_args.device = device
-        
-        pretrain_state_dict = state["state_dict"]
-        pretrain_args.local_rank = args.local_rank
-
-        attn_model, flow, state = init_model(pretrain_args)
-        if hasattr(attn_model, "module"):
-            attn_model = attn_model.module
-
-        pretrain_state_dict = {k.replace("module.", ""): v for k, v in pretrain_state_dict.items()}
-        attn_model.load_state_dict(pretrain_state_dict)
-        log_rank_0(f"Loaded pretrained state_dict from {checkpoint}")
-
-        os.makedirs(args.result_path, exist_ok=True)
-        results_path = os.path.join(args.result_path, f'{phase}-{args.sample_size}-{checkpoint.split(".")[-2]}.txt')
-        if os.path.isfile(results_path):
-            with open(results_path, 'r') as fp:
-                n_lines = len(fp.readlines())
-                file_mod = 'a'
-                start = n_lines
-            log_rank_0(f"Continuing previous runs at reaction {start}...")
-        else:
-            log_rank_0("Starting new run...")
-            file_mod = 'w'
-            start = 0
-
-        if args.do_validate:
-            with open(args.val_path, 'r') as test_o:
-                test_smiles_list = test_o.readlines()[start:]
-        else:
-            with open(args.test_path, 'r') as test_o:
-                test_smiles_list = test_o.readlines()[start:]
-        
-        assert len(test_smiles_list) > 0, "Nothing to do inference"
-        
-        test_dataset = ReactionDataset(args, test_smiles_list)
-        test_loader = init_loader(args, test_dataset,
-                                batch_size=args.test_batch_size,
-                                shuffle=False, epoch=None, use_sort=False)
-
-        with open(results_path, file_mod) as result_o:
-            metrics = get_predictions(args, attn_model, flow, test_loader, write_o=result_o)
-        if dist.get_rank() == 0:
-            metrics = np.array(metrics)
-            topk_accuracies = np.mean(metrics[:, 0].astype(bool)) # correct smiles
-            log_rank_0(f"Topk accuracies: {(topk_accuracies * 100): .2f}")
-
-if __name__ == "__main__":
-    args = Args
-    args.local_rank = int(os.environ["LOCAL_RANK"]) if os.environ.get("LOCAL_RANK") else -1
-    logger = setup_logger(args, "eval")
-    log_args(args, 'evaluation') 
-    main(args)

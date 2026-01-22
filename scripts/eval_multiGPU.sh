@@ -1,6 +1,6 @@
 #!/bin/sh
 
-torchrun \
+python -m torch.distributed.run \
   --node_rank="$NODE_RANK" \
   --nnodes="$NUM_NODES"\
   --nproc_per_node="$NUM_GPUS_PER_NODE" \

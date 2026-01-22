@@ -1,5 +1,6 @@
 import os
 import sys
+import glob
 import time
 import datetime
 import logging
@@ -7,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+import wandb
 from model.attn_encoder import AttnEncoderXL
 from utils.data_utils import ReactionDataset
 from torch.utils.data import DataLoader
@@ -14,7 +16,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 from settings import Args
-from model.flow_matching import ConditionalFlowMatcher
+from model.flow_matching import DiscreteFlowMatcher 
 from utils.train_utils import get_lr, grad_norm, log_rank_0, NoamLR, \
     param_count, param_norm, set_seed, setup_logger, log_args
 from torch.nn.init import xavier_uniform_
@@ -38,6 +40,8 @@ def init_dist(args):
 
 def init_model(args):
     state = {}
+    flow_model = DiscreteFlowMatcher(args) 
+    
     if args.load_from:
         log_rank_0(f"Loading pretrained state from {args.load_from}")
         state = torch.load(args.load_from, map_location=torch.device("cpu"))
@@ -49,16 +53,15 @@ def init_model(args):
         pretrain_state_dict = {k.replace("module.", ""): v for k, v in pretrain_state_dict.items()}
         graph_attn_model.load_state_dict(pretrain_state_dict)
         log_rank_0("Loaded pretrained model state_dict.")
-        flow_model = ConditionalFlowMatcher(args)
     else:
         graph_attn_model = AttnEncoderXL(args)
-        flow_model = ConditionalFlowMatcher(args)
         for p in graph_attn_model.parameters():
             if p.dim() > 1 and p.requires_grad:
                 xavier_uniform_(p)
 
     graph_attn_model.to(args.device)
     flow_model.to(args.device)
+    
     if args.local_rank != -1:
         graph_attn_model = DDP(
             graph_attn_model,
@@ -106,16 +109,12 @@ def get_optimizer_and_scheduler(args, model, state=None):
         eps=args.eps,
         weight_decay=args.weight_decay
     )
-    # scheduler = None
+    
     scheduler = NoamLR(
         optimizer,
         model_size=args.emb_dim,
         warmup_steps=args.warmup_steps
     )
-    # scheduler = optim.lr_scheduler.StepLR(
-    #     optimizer, 
-    #     step_size=args.eval_iter, gamma=0.99
-    # )
 
     if state and args.resume:
         optimizer.load_state_dict(state["optimizer"])
@@ -133,6 +132,14 @@ def _optimize(args, model, optimizer, scheduler):
     return g_norm
 
 def main(args):
+    if not args.load_from:
+        checkpoints = glob.glob(os.path.join(args.model_path, "*.pt"))
+        if checkpoints:
+            latest_checkpoint = sorted(checkpoints, key=lambda x: int(x.split('.')[-2].split('_')[0]))[-1]
+            args.load_from = latest_checkpoint
+            args.resume = True
+            log_rank_0(f"Auto-resuming from latest checkpoint: {latest_checkpoint}")
+
     args.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     device = args.device
 
@@ -144,23 +151,34 @@ def main(args):
 
     optimizer, scheduler = get_optimizer_and_scheduler(args, model, state)
 
+    if dist.get_rank() == 0:
+        config_dict = {k: v for k, v in vars(args).items() if not k.startswith('__')}
+        
+        wandb.init(
+            project=args.log_file, 
+            name=args.exp_name, 
+            config=config_dict
+        )
+
     log_rank_0(f"Initializing training ...")
     log_rank_0(f"Loading data ...")
-    with open(args.train_path, 'r') as train_o:
-        train_smiles_list = train_o.readlines()
-    with open(args.val_path, 'r') as val_o:
-        val_smiles_list = val_o.readlines()
-    
-    train_dataset = ReactionDataset(args, train_smiles_list)
-    val_dataset = ReactionDataset(args, val_smiles_list)
+    if args.train_path.endswith('.pt'):
+        train_dataset = ReactionDataset(args, smiles_list=None, cache_path=args.train_path)
+        val_dataset = ReactionDataset(args, smiles_list=None, cache_path=args.val_path)
+    else:
+        with open(args.train_path, 'r') as train_o:
+            train_smiles_list = train_o.readlines()
+        with open(args.val_path, 'r') as val_o:
+            val_smiles_list = val_o.readlines()
+        train_dataset = ReactionDataset(args, train_smiles_list)
+        val_dataset = ReactionDataset(args, val_smiles_list)
 
     accum = 0
     g_norm = 0
-    losses, accs = [], []
+    losses = []
     o_start = time.time()
     log_rank_0("Start training")
 
-    accuracy = []
     for epoch in range(args.epoch):
         log_rank_0(f"Epoch: {epoch}")
         train_loader = init_loader(args, train_dataset,
@@ -170,33 +188,35 @@ def main(args):
         for train_batch in train_loader:
             if total_step > args.max_steps:
                 log_rank_0("Max steps reached, finish training")
+                if dist.get_rank() == 0: wandb.finish()
                 exit(0)
 
             train_batch.to(device)
             model.train()
-            model.zero_grad(set_to_none=True)
 
             y = train_batch.src_token_ids
             y_len = train_batch.src_lens
             x0 = train_batch.src_matrices
-            x1 = train_batch.tgt_matrices
-            matrix_masks = train_batch.matrix_masks
             
-
-            x0_sample = flow.sample_be_matrix(x0)
+            arrows = train_batch.src_arrows
+            arrow_lens = train_batch.src_arrow_lens
+            matrix_masks = train_batch.matrix_masks
 
             t = torch.rand(x0.shape[0]).type_as(x0)
             
-            xt = flow.sample_conditional_pt(x0, x1, t)
-            ut = flow.compute_conditional_vector_field(x0_sample, x1)
+            xt, target_rates, arrow_mask = flow.sample_conditional_pt(x0, arrows, arrow_lens, t)
 
             if hasattr(model, "module"):
-                model = model.module        # unwrap DDP attn_model to enable accessing attn_model func directly
-            y_emb = model.id2emb(y)
-            vt = model(y_emb, y_len, xt, t)
+                model_inner = model.module  
+            else:
+                model_inner = model
 
-            loss = (vt - ut) * matrix_masks
-            loss = torch.sum((loss) ** 2) / loss.shape[0]
+            y_emb = model_inner.id2emb(y)
+            
+            s_prop, t_prop = model(y_emb, y_len, xt, t)
+
+            loss = flow.compute_loss((s_prop, t_prop), target_rates, arrows, arrow_mask)
+            
             (loss / args.accumulation_count).backward()
             losses.append(loss.item())
 
@@ -206,62 +226,71 @@ def main(args):
                 accum = 0
                 total_step += 1
 
-            if (accum == 0) and (total_step > 0) and (total_step % args.log_iter == 0):
-                log_rank_0(f"Step {total_step}, loss: {np.mean(losses): .4f}, "
-                        #    f"acc: {np.mean(accs): .4f},
-                           f"p_norm: {param_norm(model): .4f}, g_norm: {g_norm: .4f}, "
-                           f"lr: {get_lr(optimizer): .6f}, "
-                           f"elapsed time: {time.time() - o_start: .0f}")
-                losses, acc = [], []
+                if (total_step % args.log_iter == 0) and (dist.get_rank() == 0):
+                    avg_loss = np.mean(losses)
+                    curr_lr = get_lr(optimizer)
+                    p_norm = param_norm(model)
+                    
+                    log_rank_0(f"Step {total_step}, loss: {avg_loss: .4f}, "
+                               f"p_norm: {p_norm: .4f}, g_norm: {g_norm: .4f}, "
+                               f"lr: {curr_lr: .6f}, "
+                               f"elapsed time: {time.time() - o_start: .0f}")
+                    
+                    wandb.log({
+                        "train/loss": avg_loss,
+                        "train/grad_norm": g_norm,
+                        "train/param_norm": p_norm,
+                        "train/lr": curr_lr,
+                        "train/step": total_step
+                    })
+                    losses = []
 
             if (accum == 0) and (total_step > 0) and (total_step % args.eval_iter == 0):
-                val_count = 50
+                from eval_multiGPU import get_predictions
+                
+                val_count = 50 
                 val_loader = init_loader(args, val_dataset,
                                         batch_size=args.val_batch_size,
                                         shuffle=True,
                                         epoch=epoch)
-                from eval_multiGPU import get_predictions
+                
                 metrics = get_predictions(args, model, flow, val_loader, val_count)
+                
                 if dist.get_rank() == 0:
                     metrics = np.array(metrics)
-                    log_rank_0(metrics.shape)
-                    topk_accuracies = np.mean(metrics[:, 0].astype(bool)) # correct smiles
-                    log_rank_0(f"Topk accuracies: {(topk_accuracies * 100): .2f}")
+                    
+                    total_correct = np.sum(metrics[:, 0])
+                    total_samples = np.sum(metrics)
+                    
+                    val_acc = total_correct / total_samples if total_samples > 0 else 0.0
+                    
+                    log_rank_0(f"Validation Acc: {(val_acc * 100): .2f}%")
+                    
+                    wandb.log({
+                        "val/accuracy": val_acc,
+                        "val/step": total_step
+                    })
+                
                 model.train()
 
-            # Important: saving only at one node or the ckpt would be corrupted!
-            if dist.is_initialized() and dist.get_rank() > 0:
-                continue
-
-            if (accum == 0) and (total_step > 0) and (total_step % args.save_iter == 0):
-                n_iter = total_step // args.save_iter - 1
-                log_rank_0(f"Saving at step {total_step}")
-                if scheduler is not None:
+            if dist.get_rank() == 0:
+                if (accum == 0) and (total_step > 0) and (total_step % args.save_iter == 0):
+                    n_iter = total_step // args.save_iter - 1
+                    log_rank_0(f"Saving at step {total_step}")
                     state = {
                         "args": args,
                         "total_step": total_step,
                         "state_dict": model.state_dict(),
                         "optimizer": optimizer.state_dict(),
-                        "scheduler": scheduler.state_dict()
+                        "scheduler": scheduler.state_dict() if scheduler else None
                     }
-                else:
-                    state = {
-                        "args": args,
-                        "total_step": total_step,
-                        "state_dict": model.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                    }
-                torch.save(state, os.path.join(args.model_path, f"model.{total_step}_{n_iter}.pt"))
-
-        # lastly
-        if (args.accumulation_count > 1) and (accum > 0):
-            _optimize(args, model, optimizer, scheduler)
-            accum = 0
-            # total_step += 1           # for partial batch, do not increase total_step
+                    torch.save(state, os.path.join(args.model_path, f"model.{total_step}_{n_iter}.pt"))
 
         if args.local_rank != -1:
             dist.barrier()
+            
     log_rank_0("Epoch ended")
+    if dist.get_rank() == 0: wandb.finish()
     if dist.is_initialized():
         dist.destroy_process_group()
 

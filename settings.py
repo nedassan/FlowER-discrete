@@ -30,14 +30,14 @@ class Args:
     model_path = os.environ.get("MODEL_PATH")
     result_path = os.environ.get("RESULT_PATH")
     data_name = f"{DATA_NAME}"
-    log_file = f"FlowER"
+    log_file = os.environ.get("WANDB_PROJECT", "FlowER")
     load_from = ""
     # resume = True
     # load_from = f"{model_path}{MODEL_NAME}"
 
     backend = "nccl"
     num_workers = NUM_WORKERS
-    emb_dim = int(os.environ.get("EMB_DIM"))
+    emb_dim = int(os.environ.get("EMB_DIM", 512)) # default for safety
     enc_num_layers = 12
     post_processing_layers = 1
     enc_heads = 32
@@ -46,7 +46,7 @@ class Args:
     attn_dropout = 0.0
     rel_pos = "emb_only"
     shared_attention_layer = 0
-    sigma = float(os.environ.get("SIGMA"))
+    sigma = float(os.environ.get("SIGMA", 0.0))
     train_batch_size = (TRAIN_BATCH_SIZE / ACCUMULATION_COUNT / NUM_GPU / NUM_NODES)
     val_batch_size = (VAL_BATCH_SIZE / ACCUMULATION_COUNT / NUM_GPU / NUM_NODES)
     test_batch_size = TEST_BATCH_SIZE
@@ -57,7 +57,7 @@ class Args:
     eps = 1e-9
     weight_decay = 1e-2
     warmup_steps = 30000
-    clip_norm = 200
+    clip_norm = 5.0
 
 
     epoch = int(os.environ.get("EPOCH", 100))
@@ -70,8 +70,10 @@ class Args:
 
     sample_size = SAMPLE_SIZE
     rbf_low = 0
-    rbf_high = float(os.environ.get("RBF_HIGH"))
-    rbf_gap = float(os.environ.get("RBF_GAP"))
+    
+    # Ensure these are set in env or provide defaults to avoid crash
+    rbf_high = float(os.environ.get("RBF_HIGH", 20.0)) 
+    rbf_gap = float(os.environ.get("RBF_GAP", 0.1))
 
     # validation #
     # do_validate = True
@@ -79,6 +81,9 @@ class Args:
 
     # inference # 
     do_validate = False
+    
+    # NEW: Steps for Tau-Leaping in discrete inference
+    inference_steps = 100 
 
     # beam-search #
     beam_size = 5

@@ -126,7 +126,7 @@ def draw_mapped_reaction(reactant_smi, product_smi, moves=None, filename='reacti
 if __name__ == "__main__":
     # print(count_bond_types("flower_new_dataset"))
     # print(count_deltas("flower_new_dataset"))
-    arrow_pushing_dict = next(test_arrow_pushing("flower_new_dataset", 12))
+    arrow_pushing_dict = next(test_arrow_pushing("flower_new_dataset", 0))
     draw_mapped_reaction(
         arrow_pushing_dict["reactant"], 
         arrow_pushing_dict["product"], 

@@ -33,7 +33,7 @@ def build_graph(sources, sinks):
     for s, s_cap in sources:
         for t, t_cap in sinks:
             if s[0] in t or s[1] in t:
-                cap = min(s_cap, t_cap, 2)
+                cap = min(s_cap, t_cap)
                 G.add_edge(s, t, capacity=cap)
 
     return G

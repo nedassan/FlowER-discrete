@@ -3,3 +3,8 @@ logs/*
 checkpoints/*
 results/*
 *.pyc
+tests/*
+*.png
+scripts/*
+data/*
+wandb/*

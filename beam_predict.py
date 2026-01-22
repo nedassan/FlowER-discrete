@@ -7,12 +7,11 @@ from utils.data_utils import ReactionDataset, BEmatrix_to_mol, ps
 import torch.distributed as dist
 from train import init_model, init_loader
 from utils.train_utils import log_rank_0, setup_logger, log_args
-from eval_multiGPU import custom_round
+from eval_multiGPU import custom_round, predict_batch
 from settings import Args
 from collections import defaultdict
 import networkx as nx
 import pickle
-from eval_multiGPU import predict_batch
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -37,12 +36,9 @@ def select(args, frontiers_dict, graph_list):
                 max_topk_within_one_seq = max(ranks)
                 min_sequences_rank = min(max_topk_within_one_seq, min_sequences_rank)
 
-            # rank_frontiers[frontier] = min_sequences_rank
             rank_frontiers[frontier] = -cum_prob
+        
         rank_frontiers = sorted(rank_frontiers.items(), key=lambda x:x[1])[:args.beam_size]
-        # leftover_frontiers = sorted(rank_frontiers.items(), key=lambda x:x[1])[args.beam_size:]
-        # graph.remove_nodes_from([frontier for frontier, prob in leftover_frontiers])
-
         filtered_frontiers_dict[g_idx] = list(dict(rank_frontiers).keys())
     return filtered_frontiers_dict
 
@@ -52,13 +48,12 @@ def expand(args, model, flow, data_loader):
 
     overall_dict = {}
     for batch_idx, data_batch in enumerate(data_loader):
-        # print(data_batch.src_matrices.shape)
         data_batch.to(args.device)
         src_data_indices = data_batch.src_data_indices
         y = data_batch.src_token_ids
         y_len = data_batch.src_lens
         x0 = data_batch.src_matrices
-        matrix_masks = data_batch.matrix_masks
+        # matrix_masks = data_batch.matrix_masks # Unused here
         src_smiles_list = data_batch.src_smiles_list
 
         batch_size, n, n = x0.shape
@@ -68,9 +63,10 @@ def expand(args, model, flow, data_loader):
         else:
             traj_list = predict_batch(args, batch_idx, data_batch, model, flow, 2)
 
+        last_step = traj_list[-1] 
         
-        last_step = traj_list[-1]
         product_BE_matrices = custom_round(last_step)
+        
         product_BE_matrices_batch = torch.split(product_BE_matrices, sample_size)
 
         for idx in range(batch_size):
@@ -78,25 +74,32 @@ def expand(args, model, flow, data_loader):
                 src_smiles_list[idx], product_BE_matrices_batch[idx]
 
             reac_mol = Chem.MolFromSmiles(reac_smi, ps)
+            
             matrices, counts = torch.unique(product_BE_matrices, dim=0, return_counts=True)
             matrices, counts = matrices.cpu().numpy(), counts.cpu().numpy()
             
             pred_smis_dict = defaultdict(int)
             for i in range(matrices.shape[0]): # all unique matrices
-                pred_prod_be_matrix, count = matrices[i], counts[i] # predicted product matrix and it's count
+                pred_prod_be_matrix, count = matrices[i], counts[i]
                 num_nodes = y_len[idx]
                 pred_prod_be_matrix = pred_prod_be_matrix[:num_nodes, :num_nodes]
                 reac_be_matrix = x0[idx][:num_nodes, :num_nodes].detach().cpu().numpy()
 
                 assert pred_prod_be_matrix.shape == reac_be_matrix.shape, "pred and reac not the same shape"
                 
+                if abs(pred_prod_be_matrix.sum() - reac_be_matrix.sum()) > 1e-3:
+                    continue
+
                 try:
                     pred_mol = BEmatrix_to_mol(reac_mol, pred_prod_be_matrix)
                     pred_smi = standardize_smiles(pred_mol)
+                    
                     pred_mol = Chem.MolFromSmiles(pred_smi, ps)
                     pred_smi = standardize_smiles(pred_mol)
+                    
                     pred_smis_dict[pred_smi] += count
-                except: pass
+                except: 
+                    pass
 
             pred_smis_tuples = sorted(pred_smis_dict.items(), key=lambda x: x[1], reverse=True)
             
@@ -111,8 +114,6 @@ def reactant_process(smi):
         mol = Chem.AddHs(mol, explicitOnly=False)
         for idx, atom in enumerate(mol.GetAtoms()):
             atom.SetAtomMapNum(idx+1)
-        # src_smi = reactant_process(src_smi)
-        # print(src_smi)
         return Chem.MolToSmiles(mol, isomericSmiles=False, allHsExplicit=True)
     except:
         print(smi)
@@ -127,9 +128,9 @@ def clean(smi):
 
 def beam_search(args, model, flow, frontiers_dict, graph_list):
     smiles_list = [frontier for frontiers in frontiers_dict.values() for frontier in frontiers]
-    # print('frontiers', smiles_list)
-    # print()
+    
     if len(smiles_list) == 0: return
+    
     log_rank_0(f"Current Depth: {[graph.nodes[root]['depth'] for graph, root, _ in graph_list]}")
     exclude_gidx = [g_idx for g_idx, (graph, root, _) in enumerate(graph_list) 
                     if graph.nodes[root]['depth'] >= args.max_depth]
@@ -144,20 +145,24 @@ def beam_search(args, model, flow, frontiers_dict, graph_list):
         return
     
     overall_dict = expand(args, model, flow, test_loader)
+    
     new_frontiers_dict = defaultdict(list)
-
     existing_reactions = {g_idx: {} for g_idx in frontiers_dict.keys()}
+    
     for g_idx, frontiers in frontiers_dict.items():
         if g_idx in exclude_gidx: continue
         existing_reaction = existing_reactions[g_idx]
         graph, _, _ = graph_list[g_idx]
+        
         for frontier in frontiers:
-            clean_frontier = clean(frontier) # ---
-            try: product_info_dict = overall_dict[frontier] # given reactant, product info
+            clean_frontier = clean(frontier)
+            try: product_info_dict = overall_dict[frontier]
             except: continue
+            
             for rank, (product, count) in enumerate(product_info_dict.items()):
-                try: clean_product = clean(product) # --
+                try: clean_product = clean(product)
                 except: continue
+                
                 if (clean_frontier, clean_product) in existing_reaction:
                     stored_frontier, stored_product = existing_reaction[(clean_frontier, clean_product)]
                     parent_current = list(graph.predecessors(frontier))
@@ -169,11 +174,13 @@ def beam_search(args, model, flow, frontiers_dict, graph_list):
                 else:
                     if not graph.has_node(product):
                         new_frontiers_dict[g_idx].append(product)
+                    
                     graph.add_edge(frontier, product, rank=rank, count=count)
                     existing_reaction[(clean_frontier, clean_product)] = (frontier, product)
                     
 
     filtered_frontiers_dict = select(args, new_frontiers_dict, graph_list)
+    
     beam_search(args, model, flow, filtered_frontiers_dict, graph_list)
 
 def check_if_successful(graph, products):
@@ -201,6 +208,7 @@ def main(args, seed=0):
 
     for i, chunk in enumerate(chunked_list):
         log_rank_0(f"Group Chunk-{i} called:")
+        
         checkpoint = os.path.join(args.model_path, args.model_name)
         state = torch.load(checkpoint, weights_only=False, map_location=device)
         pretrain_args = state["args"]
@@ -212,7 +220,7 @@ def main(args, seed=0):
 
         attn_model, flow, state = init_model(pretrain_args)
         if hasattr(attn_model, "module"):
-            attn_model = attn_model.module        # unwrap DDP attn_model to enable accessing attn_model func directly
+            attn_model = attn_model.module 
 
         pretrain_state_dict = {k.replace("module.", ""): v for k, v in pretrain_state_dict.items()}
         attn_model.load_state_dict(pretrain_state_dict)
@@ -223,7 +231,7 @@ def main(args, seed=0):
         for idx, line in enumerate(chunk):
             if ">>" in line:
                 ori_reactant = line.strip().split(">>")[0]
-                products = line.strip().split(">>")[1].split("|") # major products
+                products = line.strip().split(">>")[1].split("|") 
                 products = [Chem.MolToSmiles(Chem.MolFromSmiles(smi)) for smi in products]
             else:
                 ori_reactant = line.strip()
@@ -238,7 +246,6 @@ def main(args, seed=0):
 
         all_results = []
         for beam_idx, (graph, root, (reactant, products)) in enumerate(graph_list):
-            # print(output_chunk_idx, reaction)
             check = check_if_successful(graph, products)
             log_rank_0(f"Beam Search Results {beam_idx}: {len(check)}/{len(products)} - {check}")
             all_results.append((graph, root, (reactant, products), check))

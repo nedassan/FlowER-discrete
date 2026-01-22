@@ -1,10 +1,9 @@
 import math
 import torch
 import torch.nn as nn
-from utils.attn_utils import PositionwiseFeedForward
-from utils.attn_utils import sequence_mask
+from utils.attn_utils import PositionwiseFeedForward, sequence_mask
 from utils.data_utils import ELEM_LIST
-from model.flow_matching import zero_center_func
+from model.flow_matching import DiscreteFlowMatcher
 
 def timestep_embedding(timesteps, dim, max_period=10000):
     """Create sinusoidal timestep embeddings.
@@ -234,7 +233,7 @@ class AttnEncoderXL(nn.Module):
         self.d_ff = args.enc_filter_size
         self.attention_dropout = args.attn_dropout
 
-        self.atom_embedding = nn.Embedding(len(ELEM_LIST) , self.d_model, padding_idx=0)
+        self.atom_embedding = nn.Embedding(len(ELEM_LIST), self.d_model, padding_idx=0)
         self.rbf = RBFExpansion(args)
 
         self.time_dim = self.d_model - self.rbf.dim
@@ -245,129 +244,81 @@ class AttnEncoderXL(nn.Module):
         )
 
         self.dropout = nn.Dropout(p=args.dropout)
+        
         if args.rel_pos in ["enc_only", "emb_only"]:
-            self.u = nn.Parameter(torch.randn(self.d_model), requires_grad=True)
-            self.v = nn.Parameter(torch.randn(self.d_model), requires_grad=True)
+             self.u = nn.Parameter(torch.randn(self.d_model), requires_grad=True)
+             self.v = nn.Parameter(torch.randn(self.d_model), requires_grad=True)
         else:
-            self.u = None
-            self.v = None
+             self.u = None; self.v = None
 
         if args.shared_attention_layer == 1:
-            self.attention_layer = SALayerXL(
-                args, self.d_model, self.heads, self.d_ff, args.dropout, self.attention_dropout,
-                self.u, self.v)
+            self.attention_layer = SALayerXL(args, self.d_model, self.heads, self.d_ff, args.dropout, self.attention_dropout, self.u, self.v)
         else:
-            self.attention_layers = nn.ModuleList(
-                [SALayerXL(
-                    args, self.d_model, self.heads, self.d_ff, args.dropout, self.attention_dropout,
-                    self.u, self.v)
-                 for i in range(self.num_layers)])
-        self.layer_norm = nn.LayerNorm(self.d_model, eps=1e-6)
+            self.attention_layers = nn.ModuleList([SALayerXL(args, self.d_model, self.heads, self.d_ff, args.dropout, self.attention_dropout, self.u, self.v) for i in range(self.num_layers)])
         
-        self.query_w = torch.nn.Sequential(
-            *[Block(self.d_model) for _ in range(self.post_processing_layers)]
-        )
-        self.key_w = torch.nn.Sequential(
-            *[Block(self.d_model) for _ in range(self.post_processing_layers)]
-        )
+        self.layer_norm = nn.LayerNorm(self.d_model, eps=1e-6)
 
-        self.query_diag_w = torch.nn.Sequential(
-            *[Block(self.d_model) for _ in range(self.post_processing_layers)]
+        self.pair_mixer = nn.Sequential(
+            nn.Linear(self.d_model * 2, self.d_model),
+            nn.GELU(),
+            nn.Linear(self.d_model, self.d_model),
+            nn.LayerNorm(self.d_model)
         )
-        self.key_diag_w = torch.nn.Sequential(
-            *[Block(self.d_model) for _ in range(self.post_processing_layers)]
-        )
-        self.value_diag_w = torch.nn.Sequential(
-            *[Block(self.d_model) for _ in range(self.post_processing_layers)]
-        )
-        self.final_diag_w = torch.nn.Linear(self.d_model, 1)
-
-        self.rel_emb_w = torch.nn.Sequential(
-            *[*[Block(self.d_model) for _ in range(self.post_processing_layers)], 
-            torch.nn.Linear(self.d_model, 1)]
-        )
-        self.softmax = nn.Softmax(dim=-1)
-
+        
         rbf_layers = []
-        # rbf_layers.append(torch.nn.Linear(self.rbf.dim+1, self.rbf.dim))
         for _ in range(self.post_processing_layers):
             rbf_layers.append(Block(self.rbf.dim))
         self.rbf_linear = torch.nn.Sequential(*rbf_layers)
-        self.rbf_final_linear = torch.nn.Linear(self.rbf.dim, 1)
 
-    def id2emb(self, src_token_id):
-        return self.atom_embedding(src_token_id)
+        self.source_head = nn.Linear(self.d_model + self.rbf.dim, 1)
+        self.sink_head = nn.Linear(self.d_model + self.rbf.dim, 1)
         
-    def forward(self, src, lengths, bond_matrix, timestep):
-        """adapt from onmt TransformerEncoder
-            src_token_id: (b, t, h)
-            lengths: (b,)
+        self.softplus = nn.Softplus()
 
-            NEW on Jan'23: return: (b, t, h)
-        """
+    def id2emb(self, ids):
+        return self.atom_embedding(ids)
+
+    def forward(self, src, lengths, bond_matrix, timestep):
         if timestep.dim() == 0:
             timestep = timestep.repeat(lengths.shape[0])
 
         b, n, _ = bond_matrix.shape
-        timestep = self.time_embed(timestep_embedding(timestep, self.time_dim))
-        timestep = timestep.unsqueeze(1).unsqueeze(1) # unsqueeze to match bond n x n
-        timestep = timestep.repeat(1, n, n, 1) # unsqueeze to match bond n x n
+        
+        timestep_emb = self.time_embed(timestep_embedding(timestep, self.time_dim))
+        timestep_emb = timestep_emb.view(b, 1, 1, self.time_dim).repeat(1, n, n, 1)
 
         mask = ~sequence_mask(lengths).unsqueeze(1)
-        
         matrix_masks = ~(~mask * ~mask.transpose(1, 2)).bool()
+
         rbf_bond_matrix = self.rbf(bond_matrix, matrix_masks)
-        rbf_bond_matrix = self.rbf_linear(rbf_bond_matrix)           # b, n, n, 1 -> b, n, n, rbf-dim
+        rbf_bond_matrix = self.rbf_linear(rbf_bond_matrix)
         
-        rel_emb = torch.cat((rbf_bond_matrix, timestep), dim=-1) # b, n, n, d
+        rel_emb = torch.cat((rbf_bond_matrix, timestep_emb), dim=-1)
 
-        # src = self.atom_embedding(src_token_id)
-        # h_place = (src_token_id == 1).float().unsqueeze(-1).repeat(1, 1, src.shape[-1])
-
-        b, n, d = src.shape 
- 
-        # a_i - raw atom embeddings
         a_i = src * math.sqrt(self.d_model)
         a_i = self.dropout(a_i)
 
         if self.args.shared_attention_layer == 1:
-            layer = self.attention_layer
-            for i in range(self.num_layers):
-                a_i = layer(a_i, mask, rel_emb)
+            for _ in range(self.num_layers):
+                a_i = self.attention_layer(a_i, mask, rel_emb)
         else:
             for layer in self.attention_layers:
                 a_i = layer(a_i, mask, rel_emb)
-        a_i = self.layer_norm(a_i)                        # b,n,d
+        a_i = self.layer_norm(a_i)
+
+        pair_emb = self.pair_mixer(torch.cat([
+            a_i.unsqueeze(2).expand(b, n, n, -1), 
+            a_i.unsqueeze(1).expand(b, n, n, -1)
+        ], dim=-1))
         
-        # a_i - atom embeddings after multiheaded attention on atom embeddings + rbf expansion
+        pair_emb = 0.5 * (pair_emb + pair_emb.transpose(1, 2))
 
-        # diagonal prediction
-        query_diag = self.query_diag_w(a_i)             # b,n,d @ d,d -> b,n,d
-        key_diag = self.key_diag_w(a_i)                 # b,n,d @ d,d -> b,n,d
-        value_diag = self.value_diag_w(a_i)             # b,n,d @ d,d -> b,n,d
+        full_pair = torch.cat([pair_emb, rbf_bond_matrix], dim=-1)
 
-        diag_scores = torch.matmul(query_diag, key_diag.transpose(1, 2)) # b,n,d @ b,d,n -> b,n,n
-        diag_scores = diag_scores.masked_fill(matrix_masks, 1e-9)
-        diag_scores = self.softmax(diag_scores) / math.sqrt(self.d_model)
-        context = torch.matmul(diag_scores, value_diag)    # b,n,n @ b,n,d -> b,n,d
-        diag = self.final_diag_w(context).view(b, n)       # b,n,d @ d,1 -> b,n,1 -> b,n
+        s_logits = self.source_head(full_pair).squeeze(-1)
+        t_logits = self.sink_head(full_pair).squeeze(-1)
         
-        # non diagonal prediction
-        query = self.query_w(a_i)                          # b,n,d @ d,d -> b,n,d
-        key = self.key_w(a_i) 
+        log_s_prop = torch.nn.functional.logsigmoid(s_logits)
+        log_t_prop = torch.nn.functional.logsigmoid(t_logits)
 
-        scores = torch.matmul(query, key.transpose(1, 2))  # b,n,d @ b,d,n -> b,n,n
-        a_ij = scores / math.sqrt(self.d_model)
-
-        rbfw_ij = self.rel_emb_w(rel_emb).view(b, n, n)   # b,n,n,d @ d,1 -> b,n,n,1 -> b,n,n
-        out = a_ij + rbfw_ij
-
-        for i in range(b):
-            indices = torch.arange(n)
-            out[i, indices, indices] = 0
-            out[i].diagonal().add_(diag[i])
-
-        out = zero_center_output(out, matrix_masks)
-        out = (out + out.transpose(1, 2))
-
-        return out
+        return log_s_prop * (~matrix_masks).float(), log_t_prop * (~matrix_masks).float()

@@ -2,93 +2,79 @@ import torch
 import torch.nn as nn
 from utils.data_utils import MATRIX_PAD
 
-def zero_center_func(x, node_mask):
-    N = node_mask.sum()
-    mean = torch.sum(x) / N
-    x = x - mean * node_mask
-    return x
-
-class ConditionalFlowMatcher(nn.Module):
-    """Base class for conditional flow matching methods. This class implements the independent
-    conditional flow matching methods from [1] and serves as a parent class for all other flow
-    matching methods.
-
-    It implements:
-    - Drawing data from gaussian probability path N(t * x1 + (1 - t) * x0, sigma) function
-    - conditional flow matching ut(x1|x0) = x1 - x0
-    - score function $\nabla log p_t(x|x0, x1)$
+class DiscreteFlowMatcher(nn.Module):
+    """
+    Implements Discrete Flow Matching on the Mass-Conserving Manifold.
     """
 
     def __init__(self, args):
-        r"""Initialize the ConditionalFlowMatcher class. It requires the hyper-parameter $\sigma$.
-
-        Parameters
-        ----------
-        sigma : float
-        """
         super().__init__()
         self.args = args
         self.device = args.device
-        self.sigma = args.sigma
-        self.dim = args.emb_dim
+        self.eps = 1e-4
 
-    def zero_centered_noise(self, size, node_mask_batch):
-        rand = torch.randn(size).to(self.device)
-        x_batch = rand * node_mask_batch
-        map_zero_center = torch.vmap(zero_center_func) # map on multiple batch
-        return map_zero_center(x_batch, node_mask_batch).masked_fill(~(node_mask_batch.bool()), 1e-19)
-
-    def sample_be_matrix(self, matrix):
-        node_mask = (matrix[:, :, 0] != MATRIX_PAD)
-        masks = (node_mask.unsqueeze(1) * node_mask.unsqueeze(2)).long()
-
-        noise = self.zero_centered_noise(masks.shape, masks) # (n, n, b, d)
-        noise = 0.5 * (noise + noise.transpose(1, 2))
-        matrix = matrix + noise * self.sigma
+    def sample_conditional_pt(self, x0, arrows, arrow_lens, t):
+        """
+        Generates the intermediate state x_t given reactants x_0 and the mechanistic arrows.
+        Same as before.
+        """
+        B, N, _ = x0.shape
+        xt = x0.clone()
         
-        return matrix
+        t_expanded = t.view(B, 1)
 
-    def sample_conditional_pt(self, x0, x1, t):
-        """
-        Draw a sample from the probability path N(t * x1 + (1 - t) * x0, sigma), see (Eq.14) [1].
+        src_u = arrows[:, :, 0].long()
+        src_v = arrows[:, :, 1].long()
+        sink_u = arrows[:, :, 2].long()
+        sink_v = arrows[:, :, 3].long()
+        n_total = arrows[:, :, 4]
 
-        Parameters
-        ----------
-        x0 : Tensor, shape (bs, *dim)
-            represents the source minibatch
-        x1 : Tensor, shape (bs, *dim)
-            represents the target minibatch
-        t : FloatTensor, shape (bs)
+        probs = t_expanded.expand_as(n_total)
+        k_jumped = torch.binomial(n_total, probs)
 
-        Returns
-        -------
-        xt : Tensor, shape (bs, *dim)
+        batch_indices = torch.arange(B, device=self.device).view(B, 1).expand(B, arrows.size(1))
+        mask = torch.arange(arrows.size(1), device=self.device).expand(B, arrows.size(1)) < arrow_lens.unsqueeze(1)
+        
+        b_idx = batch_indices[mask]
+        s_u_idx = src_u[mask]
+        s_v_idx = src_v[mask]
+        k_u_idx = sink_u[mask]
+        k_v_idx = sink_v[mask]
+        vals = k_jumped[mask]
 
-        References
-        ----------
-        [1] Improving and Generalizing Flow-Based Generative Models with minibatch optimal transport, Preprint, Tong et al.
-        """
-        t = t.reshape(-1, *([1] * (x0.dim() - 1)))
-        mu_t = t * x1 + (1 - t) * x0
-        return self.sample_be_matrix(mu_t)
+        xt.index_put_((b_idx, s_u_idx, s_v_idx), -vals, accumulate=True)
+        non_diag_src = (s_u_idx != s_v_idx)
+        xt.index_put_((b_idx[non_diag_src], s_v_idx[non_diag_src], s_u_idx[non_diag_src]), -vals[non_diag_src], accumulate=True)
+        
+        xt.index_put_((b_idx, k_u_idx, k_v_idx), vals, accumulate=True)
+        non_diag_sink = (k_u_idx != k_v_idx)
+        xt.index_put_((b_idx[non_diag_sink], k_v_idx[non_diag_sink], k_u_idx[non_diag_sink]), vals[non_diag_sink], accumulate=True)
 
-    def compute_conditional_vector_field(self, x0, x1):
-        """
-        Compute the conditional vector field ut(x1|x0) = x1 - x0, see Eq.(15) [1].
+        n_remaining = n_total - k_jumped
+        denom = 1.0 - t_expanded + self.eps
+        target_rates_all = n_remaining / denom
+        
+        return xt, target_rates_all, mask
 
-        Parameters
-        ----------
-        x0 : Tensor, shape (bs, *dim)
-            represents the source minibatch
-        x1 : Tensor, shape (bs, *dim)
-            represents the target minibatch
+    def compute_loss(self, pred_props, target_rates, arrows, arrow_mask):
+        log_s_prop, log_t_prop = pred_props
+        B = log_s_prop.size(0)
+        
+        src_u = arrows[:, :, 0].long()
+        src_v = arrows[:, :, 1].long()
+        sink_u = arrows[:, :, 2].long()
+        sink_v = arrows[:, :, 3].long()
 
-        Returns
-        -------
-        ut : conditional vector field ut(x1|x0) = x1 - x0
+        batch_idx = torch.arange(B, device=self.device).view(B, 1).expand_as(src_u)
+        
+        log_pred_rates = log_s_prop[batch_idx, src_u, src_v] + log_t_prop[batch_idx, sink_u, sink_v]
+        pred_rates = torch.exp(log_pred_rates)
 
-        References
-        ----------
-        [1] Improving and Generalizing Flow-Based Generative Models with minibatch optimal transport, Preprint, Tong et al.
-        """
-        return x1 - x0
+        if arrow_mask.any():
+            loss_active = ((pred_rates[arrow_mask] - target_rates[arrow_mask])**2).mean()
+        else:
+            loss_active = torch.tensor(0.0, device=self.device)
+
+        loss_bg = (log_s_prop**2).mean() + (log_t_prop**2).mean()
+        
+        return loss_active + 0.01 * loss_bg

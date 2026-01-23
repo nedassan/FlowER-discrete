@@ -276,6 +276,15 @@ class AttnEncoderXL(nn.Module):
         torch.nn.init.normal_(self.source_head.weight, std=0.01)
         torch.nn.init.normal_(self.sink_head.weight, std=0.01)
 
+        self.stop_head = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model),
+            nn.SiLU(),
+            nn.Linear(self.d_model, 2)
+        )
+        for m in self.stop_head:
+            if isinstance(m, nn.Linear):
+                torch.nn.init.normal_(m.weight, std=0.01)
+
         self.softplus = nn.Softplus()
 
     def id2emb(self, ids):
@@ -309,6 +318,12 @@ class AttnEncoderXL(nn.Module):
                 a_i = layer(a_i, mask, rel_emb)
         a_i = self.layer_norm(a_i)
 
+        mask_float = sequence_mask(lengths).unsqueeze(-1).float()
+
+        global_mol_feat = (a_i * mask_float).sum(dim=1) / (lengths.unsqueeze(-1) + 1e-9)
+
+        stop_logits = self.stop_head(global_mol_feat)
+
         pair_emb = self.pair_mixer(torch.cat([
             a_i.unsqueeze(2).expand(b, n, n, -1), 
             a_i.unsqueeze(1).expand(b, n, n, -1)
@@ -321,4 +336,4 @@ class AttnEncoderXL(nn.Module):
         source_prop = self.source_head(full_pair)
         sink_prop = self.sink_head(full_pair)
 
-        return source_prop, sink_prop
+        return source_prop, sink_prop, stop_logits

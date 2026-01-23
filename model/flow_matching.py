@@ -57,8 +57,8 @@ class DiscreteFlowMatcher(nn.Module):
         
         return xt, target_rates_all, mask
 
-    def compute_loss(self, pred_props, target_rates, arrows, arrow_mask, matrix_masks):
-        source_props, sink_props = pred_props
+    def compute_loss(self, pred_props, target_rates, arrows, arrow_lens, matrix_masks):
+        source_props, sink_props, stop_logits = pred_props
         B, N, _, _ = source_props.shape
 
         ignore_mask = matrix_masks.view(B, -1).eq(0) 
@@ -66,33 +66,52 @@ class DiscreteFlowMatcher(nn.Module):
 
         src_flat = source_props[..., 1].view(B, -1) 
         snk_flat = sink_props[..., 1].view(B, -1)
-        
+
         src_masked = src_flat.masked_fill(ignore_mask, -1e12)
         snk_masked = snk_flat.masked_fill(ignore_mask, -1e12)
 
-        log_p_src = torch.log_softmax(src_masked, dim=-1) 
-        log_p_snk = torch.log_softmax(snk_masked, dim=-1)
+        src_stop = stop_logits[:, :1]
+        snk_stop = stop_logits[:, 1:]
 
-        src_u, src_v = arrows[:, :, 0].long(), arrows[:, :, 1].long()
-        snk_u, snk_v = arrows[:, :, 2].long(), arrows[:, :, 3].long()
+        full_src_logits = torch.cat([src_masked, src_stop], dim=1)  
+        full_snk_logits = torch.cat([snk_masked, snk_stop], dim=1) 
 
-        gt_src_idx = (src_u * N + src_v).clamp(0, N * N - 1)
-        gt_snk_idx = (snk_u * N + snk_v).clamp(0, N * N - 1)
+        log_p_src = torch.log_softmax(full_src_logits, dim=-1) 
+        log_p_snk = torch.log_softmax(full_snk_logits, dim=-1)
 
-        gt_log_p_src = torch.gather(log_p_src, 1, gt_src_idx)
-        gt_log_p_snk = torch.gather(log_p_snk, 1, gt_snk_idx)
-
-        nll = -(gt_log_p_src + gt_log_p_snk)
-
-        loss_active = torch.tensor(0.0, device=self.device, requires_grad=True)
-        if arrow_mask.any():
-            weights = torch.log1p(torch.clamp(target_rates, max=100.0))
-            loss_active = (nll[arrow_mask] * weights[arrow_mask]).mean()
-            
-        reg_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-        if valid_entries.any():
-            reg_loss = 1e-4 * (src_flat[valid_entries]**2 + snk_flat[valid_entries]**2).mean()
-
-        total_loss = loss_active + reg_loss
+        is_termination = (arrow_lens == 0)
         
-        return total_loss, loss_active, reg_loss
+        loss_active = torch.tensor(0.0, device=self.device)
+        loss_term = torch.tensor(0.0, device=self.device)
+
+        if (~is_termination).any():
+            src_u, src_v = arrows[:, :, 0].long(), arrows[:, :, 1].long()
+            snk_u, snk_v = arrows[:, :, 2].long(), arrows[:, :, 3].long()
+
+            gt_src_idx = (src_u * N + src_v).clamp(0, N * N - 1)
+            gt_snk_idx = (snk_u * N + snk_v).clamp(0, N * N - 1)
+
+            gt_log_p_src = torch.gather(log_p_src, 1, gt_src_idx)
+            gt_log_p_snk = torch.gather(log_p_snk, 1, gt_snk_idx)
+            
+            nll_active = -(gt_log_p_src + gt_log_p_snk)
+
+            active_arrow_mask = torch.arange(arrows.size(1), device=self.device).expand(B, -1) < arrow_lens.unsqueeze(1)
+            
+            if active_arrow_mask.any():
+                weights = torch.log1p(torch.clamp(target_rates, max=100.0))
+                loss_active = (nll_active[active_arrow_mask] * weights[active_arrow_mask]).sum() / (active_arrow_mask.sum() + 1e-9)
+
+        if is_termination.any():
+            term_log_p_src = log_p_src[is_termination, -1]
+            term_log_p_snk = log_p_snk[is_termination, -1]
+            
+            nll_term = -(term_log_p_src + term_log_p_snk)
+
+            loss_term = nll_term.mean()
+
+        reg_loss = 1e-4 * (src_flat[valid_entries]**2 + snk_flat[valid_entries]**2).mean()
+
+        total_loss = loss_active + loss_term + reg_loss
+        
+        return total_loss, loss_active, loss_term

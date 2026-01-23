@@ -4,7 +4,7 @@ import datetime
 import torch
 import numpy as np
 import torch.nn as nn
-from rdkit import Chem
+from rdkit import Chem, RDLogger
 from utils.data_utils import ReactionDataset, BEmatrix_to_mol, ps
 from utils.rounding import saferound_tensor
 import torch.distributed as dist
@@ -12,10 +12,37 @@ from utils.train_utils import log_rank_0
 from settings import Args
 from collections import defaultdict
 import time
-from beam_predict import standardize_smiles
+
+# Globally disable RDKit logs for clean execution
+RDLogger.DisableLog('rdApp.*')
 
 def is_sym(a):
     return (a.transpose(1, 0) == a).all()
+
+def standardize_smiles(mol):
+    if mol is None: return "None"
+    
+    # 1. Remove Atom Mapping
+    [a.SetAtomMapNum(0) for a in mol.GetAtoms()]
+    
+    # 2. Sanitize
+    try:
+        Chem.SanitizeMol(mol)
+    except:
+        pass
+        
+    # 3. Canonicalize
+    try:
+        mol = Chem.RemoveHs(mol)
+        smi = Chem.MolToSmiles(mol, isomericSmiles=False, canonical=True)
+        mol = Chem.MolFromSmiles(smi)
+        if mol:
+            return Chem.MolToSmiles(mol, isomericSmiles=False, canonical=True)
+    except:
+        pass
+
+    # Fallback
+    return Chem.MolToSmiles(mol, isomericSmiles=False, allHsExplicit=True)
 
 def y_len_to_mask(y_len, N):
     """Creates a (B, N*N) mask where padding is True."""
@@ -62,6 +89,7 @@ def tau_leaping_batch_scatter(
     steps=100,
     device="cuda",
     max_jumps_per_atom=2,
+    rate_scalar=6.0,
 ):
     B, N, _ = x0.shape
     xt = x0.clone()
@@ -74,30 +102,29 @@ def tau_leaping_batch_scatter(
         
         s_logits, t_logits, stop_logits = model(y_emb, y_len, xt, t)
 
+        # --- SOURCE ---
         s_flat = (0.5 * (s_logits + s_logits.transpose(1, 2)))[..., 1].view(B, -1)
         s_flat = s_flat.masked_fill(mask, -1e12)
-
-        log_sum_s = torch.logsumexp(s_flat, dim=-1)
-        s_stop_logit = stop_logits[:, 0]
-
+        
+        log_sum_s = torch.logsumexp(s_flat, dim=-1)       
+        s_stop_logit = stop_logits[:, 0]                  
         log_total_s = torch.logaddexp(log_sum_s, s_stop_logit)
+        p_active_s = torch.exp(log_sum_s - log_total_s)
 
-        log_p_active_s = log_sum_s - log_total_s
-        p_active_s = torch.exp(log_p_active_s)
-
+        # --- SINK ---
         t_flat = (0.5 * (t_logits + t_logits.transpose(1, 2)))[..., 1].view(B, -1)
         t_flat = t_flat.masked_fill(mask, -1e12)
         
         log_sum_t = torch.logsumexp(t_flat, dim=-1)
         t_stop_logit = stop_logits[:, 1]
         log_total_t = torch.logaddexp(log_sum_t, t_stop_logit)
-        log_p_active_t = log_sum_t - log_total_t
-        p_active_t = torch.exp(log_p_active_t)
+        p_active_t = torch.exp(log_sum_t - log_total_t)
+        
+        # --- RATE CALCULATION ---
+        base_rate = np.sqrt(rate_scalar) 
+        rates = (base_rate * p_active_s) * (base_rate * p_active_t)
 
-        s_rate = torch.exp(log_sum_s) * p_active_s
-        t_rate = torch.exp(log_sum_t) * p_active_t
-        rates = s_rate * t_rate
-
+        # --- Standard Poisson Step ---
         max_j = max_jumps_per_atom * y_len
         total_jumps = torch.minimum(torch.poisson(rates * dt).long(), max_j)
 
@@ -129,10 +156,9 @@ def tau_leaping_batch_scatter(
         
         flat_xt = xt.view(B, -1)
         
-        src_counts = torch.minimum(src_counts, flat_xt)
-        
-        flat_xt -= src_counts
-        flat_xt += tgt_counts
+        # --- UPDATE & CONSERVATION CHECK ---
+        real_src_counts = torch.minimum(src_counts, flat_xt)
+        flat_xt = flat_xt - real_src_counts + tgt_counts
 
         xt = flat_xt.view(B, N, N)
         xt = 0.5 * (xt + xt.transpose(1, 2))
@@ -145,7 +171,6 @@ def get_predictions(args, model, flow, data_loader, iter_count=np.inf, write_o=N
     model.eval()
     
     with torch.no_grad():
-        log_rank_0('Start Tau-Leaping Evaluation...')
         inferenced_indexes = set()
 
         for batch_idx, data_batch in enumerate(data_loader):
@@ -153,6 +178,10 @@ def get_predictions(args, model, flow, data_loader, iter_count=np.inf, write_o=N
             data_batch.to(args.device)
 
             x0 = data_batch.src_matrices
+            
+            # Sanitization: Replace padding (-30) with 0.0 for physics calcs
+            x0 = torch.where(x0 < -1, torch.tensor(0.0, device=x0.device), x0)
+
             y_len = data_batch.src_lens
             if hasattr(model, "module"):
                 y_emb = model.module.id2emb(data_batch.src_token_ids)
@@ -166,6 +195,8 @@ def get_predictions(args, model, flow, data_loader, iter_count=np.inf, write_o=N
             y_len_rep = y_len.repeat_interleave(sample_size, dim=0)
             x0_rep = x0.repeat_interleave(sample_size, dim=0)
 
+            # --- GPU INFERENCE ---
+            rate_scalar = getattr(args, 'rate_scalar', 6.0)
             xt_final = tau_leaping_batch_scatter(
                 model,
                 y_emb_rep,
@@ -174,22 +205,30 @@ def get_predictions(args, model, flow, data_loader, iter_count=np.inf, write_o=N
                 steps=getattr(args, 'inference_steps', 100),
                 device=args.device,
                 max_jumps_per_atom=getattr(args, "max_jumps_per_atom", 2),
+                rate_scalar=rate_scalar
             )
-
-            true_sums = x0_rep.sum(dim=(1, 2)) 
+            
+            # --- CPU TRANSFER ---
+            xt_final = xt_final.cpu()
+            x0_rep_cpu = x0_rep.cpu()
+            true_sums = x0_rep_cpu.sum(dim=(1, 2))
+            
+            # --- ROUNDING ---
             xt_rounded = custom_round(xt_final, target_sums=true_sums)
-
+            
+            # --- GATHER ---
             if dist.is_initialized():
-                res = (data_batch.src_data_indices, xt_rounded.cpu(), x0.cpu(), 
+                res = (data_batch.src_data_indices, xt_rounded, x0.cpu(), 
                        y_len.cpu(), data_batch.src_smiles_list, data_batch.tgt_smiles_list)
                 gathered = [None] * dist.get_world_size()
                 dist.all_gather_object(gathered, res)
             else:
-                gathered = [(data_batch.src_data_indices, xt_rounded.cpu(), x0.cpu(), 
+                gathered = [(data_batch.src_data_indices, xt_rounded, x0.cpu(), 
                             y_len.cpu(), data_batch.src_smiles_list, data_batch.tgt_smiles_list)]
 
-            if dist.get_rank() != 0: continue
+            if dist.is_initialized() and dist.get_rank() != 0: continue
 
+            # --- RDKIT VALIDATION ---
             for batch_res in gathered:
                 indices, xt_list, x0_list, lens, src_smis, tgt_smis = batch_res
                 
@@ -207,15 +246,18 @@ def get_predictions(args, model, flow, data_loader, iter_count=np.inf, write_o=N
                     for s_idx in range(sample_size):
                         pred_be = samples[s_idx][:lens[b], :lens[b]].numpy()
                         reac_be = x0_list[b][:lens[b], :lens[b]].numpy()
-                        
                         pred_be = redist_fix(pred_be, src_smis[b], reac_be)
                         
                         try:
                             pred_mol = BEmatrix_to_mol(reac_mol, pred_be)
-                            if standardize_smiles(pred_mol) == gold_smi:
+                            Chem.SanitizeMol(pred_mol) 
+                            pred_smi = standardize_smiles(pred_mol)
+                            
+                            if pred_smi == gold_smi:
                                 correct_found = True
                                 break
-                        except: continue
+                        except Exception: 
+                            continue
                     
                     accuracy.append([1 if correct_found else 0])
                     if write_o: write_o.write(f"{d_idx}|{1 if correct_found else 0}\n")

@@ -9,6 +9,8 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 import wandb
+import contextlib
+import hashlib
 from model.attn_encoder import AttnEncoderXL
 from utils.data_utils import ReactionDataset
 from torch.utils.data import DataLoader
@@ -153,10 +155,14 @@ def main(args):
 
     if dist.get_rank() == 0:
         config_dict = {k: v for k, v in vars(args).items() if not k.startswith('__')}
+
+        run_id = hashlib.md5(args.exp_name.encode('utf-8')).hexdigest()
         
         wandb.init(
             project=args.log_file, 
             name=args.exp_name, 
+            id=run_id,
+            resume="allow",
             config=config_dict
         )
 
@@ -176,6 +182,7 @@ def main(args):
     accum = 0
     g_norm = 0
     losses = []
+    active_losses, reg_losses = [], []
     o_start = time.time()
     log_rank_0("Start training")
 
@@ -185,116 +192,120 @@ def main(args):
                                 batch_size=args.train_batch_size,
                                 shuffle=True,
                                 epoch=epoch)
-        for train_batch in train_loader:
-            if total_step > args.max_steps:
-                log_rank_0("Max steps reached, finish training")
-                if dist.get_rank() == 0: wandb.finish()
-                exit(0)
 
-            train_batch.to(device)
-            model.train()
+        join_context = model.join() if (dist.is_initialized() and hasattr(model, "join")) else contextlib.nullcontext()
+        
+        with join_context:
+            for train_batch in train_loader:
+                if total_step > args.max_steps:
+                    log_rank_0("Max steps reached, finish training")
+                    if dist.get_rank() == 0: wandb.finish()
+                    exit(0)
 
-            y = train_batch.src_token_ids
-            y_len = train_batch.src_lens
-            x0 = train_batch.src_matrices
-            
-            arrows = train_batch.src_arrows
-            arrow_lens = train_batch.src_arrow_lens
-            matrix_masks = train_batch.matrix_masks
-
-            t = torch.rand(x0.shape[0]).type_as(x0)
-            
-            xt, target_rates, arrow_mask = flow.sample_conditional_pt(x0, arrows, arrow_lens, t)
-
-            if hasattr(model, "module"):
-                model_inner = model.module  
-            else:
-                model_inner = model
-
-            y_emb = model_inner.id2emb(y)
-            
-            s_prop, t_prop = model(y_emb, y_len, xt, t)
-
-            loss, l_active, l_reg = flow.compute_loss((s_prop, t_prop), target_rates, arrows, arrow_mask, train_batch.matrix_masks)
-
-            (loss / args.accumulation_count).backward()
-            losses.append(loss.item())
-
-            if 'active_losses' not in locals():
-                active_losses, reg_losses = [], []
-
-            active_losses.append(l_active.item())
-            reg_losses.append(l_reg.item())
-
-            accum += 1
-            if accum == args.accumulation_count:
-                g_norm = _optimize(args, model, optimizer, scheduler)
-                accum = 0
-                total_step += 1
-
-                if (total_step % args.log_iter == 0) and (dist.get_rank() == 0):
-                    avg_loss = np.mean(losses)
-                    avg_active = np.mean(active_losses)
-                    avg_reg = np.mean(reg_losses)
-                    curr_lr = get_lr(optimizer)
-                    p_norm = param_norm(model)
-                    
-                    log_rank_0(f"Step {total_step}, loss: {avg_loss: .4f}, "
-                               f"p_norm: {p_norm: .4f}, g_norm: {g_norm: .4f}, "
-                               f"lr: {curr_lr: .6f}, "
-                               f"elapsed time: {time.time() - o_start: .0f}")
-                    
-                    wandb.log({
-                        "train/loss": avg_loss,
-                        "train/active_loss": avg_active,
-                        "train/reg_loss": avg_reg,
-                        "train/grad_norm": g_norm,
-                        "train/param_norm": p_norm,
-                        "train/lr": curr_lr,
-                        "train/step": total_step
-                    })
-                    losses = []
-
-            if (accum == 0) and (total_step > 0) and (total_step % args.eval_iter == 0):
-                from eval_multiGPU import get_predictions
-                
-                val_count = 50 
-                val_loader = init_loader(args, val_dataset,
-                                        batch_size=args.val_batch_size,
-                                        shuffle=True,
-                                        epoch=epoch)
-                
-                metrics = get_predictions(args, model, flow, val_loader, val_count)
-                
-                if dist.get_rank() == 0:
-                    metrics = np.array(metrics)
-                    
-                    total_correct = np.sum(metrics[:, 0])
-                    total_samples = np.sum(metrics)
-                    
-                    val_acc = total_correct / total_samples if total_samples > 0 else 0.0
-                    
-                    log_rank_0(f"Validation Acc: {(val_acc * 100): .2f}%")
-                    
-                    wandb.log({
-                        "val/accuracy": val_acc,
-                        "val/step": total_step
-                    })
-                
+                train_batch.to(device)
                 model.train()
 
-            if dist.get_rank() == 0:
-                if (accum == 0) and (total_step > 0) and (total_step % args.save_iter == 0):
-                    n_iter = total_step // args.save_iter - 1
-                    log_rank_0(f"Saving at step {total_step}")
-                    state = {
-                        "args": args,
-                        "total_step": total_step,
-                        "state_dict": model.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "scheduler": scheduler.state_dict() if scheduler else None
-                    }
-                    torch.save(state, os.path.join(args.model_path, f"model.{total_step}_{n_iter}.pt"))
+                y = train_batch.src_token_ids
+                y_len = train_batch.src_lens
+                x0 = train_batch.src_matrices
+                
+                arrows = train_batch.src_arrows
+                arrow_lens = train_batch.src_arrow_lens
+                matrix_masks = train_batch.matrix_masks
+
+                t = torch.rand(x0.shape[0]).type_as(x0)
+                
+                xt, target_rates, arrow_mask = flow.sample_conditional_pt(x0, arrows, arrow_lens, t)
+
+                if hasattr(model, "module"):
+                    model_inner = model.module  
+                else:
+                    model_inner = model
+
+                y_emb = model_inner.id2emb(y)
+                
+                s_prop, t_prop = model(y_emb, y_len, xt, t)
+
+                loss, l_active, l_reg = flow.compute_loss((s_prop, t_prop), target_rates, arrows, arrow_mask, train_batch.matrix_masks)
+
+                (loss / args.accumulation_count).backward()
+                losses.append(loss.item())
+
+                active_losses.append(l_active.item())
+                reg_losses.append(l_reg.item())
+
+                accum += 1
+                if accum == args.accumulation_count:
+                    g_norm = _optimize(args, model, optimizer, scheduler)
+                    accum = 0
+                    total_step += 1
+
+                    if (total_step % args.log_iter == 0) and (dist.get_rank() == 0):
+                        avg_loss = np.mean(losses)
+                        avg_active = np.mean(active_losses)
+                        avg_reg = np.mean(reg_losses)
+                        curr_lr = get_lr(optimizer)
+                        p_norm = param_norm(model)
+                        
+                        log_rank_0(f"Step {total_step}, loss: {avg_loss: .4f}, "
+                                   f"p_norm: {p_norm: .4f}, g_norm: {g_norm: .4f}, "
+                                   f"lr: {curr_lr: .6f}, "
+                                   f"elapsed time: {time.time() - o_start: .0f}")
+                        
+                        wandb.log({
+                            "train/loss": avg_loss,
+                            "train/active_loss": avg_active,
+                            "train/reg_loss": avg_reg,
+                            "train/grad_norm": g_norm,
+                            "train/param_norm": p_norm,
+                            "train/lr": curr_lr,
+                            "train/step": total_step
+                        })
+                        
+                        losses = []
+                        active_losses = []
+                        reg_losses = []
+
+                if (accum == 0) and (total_step > 0) and (total_step % args.eval_iter == 0):
+                    from eval_multiGPU import get_predictions
+                    
+                    val_count = 50 
+                    val_loader = init_loader(args, val_dataset,
+                                            batch_size=args.val_batch_size,
+                                            shuffle=True,
+                                            epoch=epoch)
+                    
+                    metrics = get_predictions(args, model, flow, val_loader, val_count)
+                    
+                    if dist.get_rank() == 0:
+                        metrics = np.array(metrics)
+                        
+                        total_correct = np.sum(metrics[:, 0])
+                        total_samples = np.sum(metrics)
+                        
+                        val_acc = total_correct / total_samples if total_samples > 0 else 0.0
+                        
+                        log_rank_0(f"Validation Acc: {(val_acc * 100): .2f}%")
+                        
+                        wandb.log({
+                            "val/accuracy": val_acc,
+                            "val/step": total_step
+                        })
+                    
+                    model.train()
+
+                if dist.get_rank() == 0:
+                    if (accum == 0) and (total_step > 0) and (total_step % args.save_iter == 0):
+                        n_iter = total_step // args.save_iter - 1
+                        log_rank_0(f"Saving at step {total_step}")
+                        state = {
+                            "args": args,
+                            "total_step": total_step,
+                            "state_dict": model.state_dict(),
+                            "optimizer": optimizer.state_dict(),
+                            "scheduler": scheduler.state_dict() if scheduler else None
+                        }
+                        torch.save(state, os.path.join(args.model_path, f"model.{total_step}_{n_iter}.pt"))
 
         if args.local_rank != -1:
             dist.barrier()

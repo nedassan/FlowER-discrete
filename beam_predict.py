@@ -7,7 +7,7 @@ from utils.data_utils import ReactionDataset, BEmatrix_to_mol, ps
 import torch.distributed as dist
 from train import init_model, init_loader
 from utils.train_utils import log_rank_0, setup_logger, log_args
-from eval_multiGPU import custom_round, tau_leaping_batch, redist_fix
+from eval_multiGPU import custom_round, tau_leaping_batch_scatter, redist_fix
 from settings import Args
 from collections import defaultdict
 import networkx as nx
@@ -51,17 +51,23 @@ def expand(args, model, flow, data_loader):
         src_smis = data_batch.src_smiles_list
         B, N, _ = x0.shape
 
-        y_emb_rep = model.id2emb(y).repeat_interleave(sample_size, dim=0)
+        if hasattr(model, "module"):
+            y_emb = model.module.id2emb(y)
+        else:
+            y_emb = model.id2emb(y)
+            
+        y_emb_rep = y_emb.repeat_interleave(sample_size, dim=0)
         y_len_rep = y_len.repeat_interleave(sample_size, dim=0)
         x0_rep = x0.repeat_interleave(sample_size, dim=0)
 
-        final_states = tau_leaping_batch(
+        final_states = tau_leaping_batch_scatter(
             model, 
             y_emb_rep, 
             y_len_rep, 
             x0_rep, 
             steps=getattr(args, 'inference_steps', 100), 
-            device=args.device
+            device=args.device,
+            max_jumps_per_atom=getattr(args, "max_jumps_per_atom", 2)
         )
 
         true_sums = x0_rep.sum(dim=(1, 2))
@@ -179,6 +185,9 @@ def main(args):
 
     checkpoint_path = os.path.join(args.model_path, args.model_name)
     state = torch.load(checkpoint_path, map_location=args.device)
+    
+    state["args"].local_rank = -1
+
     model, flow, _ = init_model(state["args"])
     
     sd = {k.replace("module.", ""): v for k, v in state["state_dict"].items()}

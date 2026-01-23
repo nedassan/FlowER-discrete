@@ -13,6 +13,7 @@ from utils.train_utils import log_rank_0, setup_logger, log_args
 from settings import Args
 from collections import defaultdict
 import time
+from beam_predict import standardize_smiles
 
 def is_sym(a):
     return (a.transpose(1, 0) == a).all()
@@ -138,7 +139,11 @@ def get_predictions(args, model, flow, data_loader, iter_count=np.inf, write_o=N
 
             x0 = data_batch.src_matrices
             y_len = data_batch.src_lens
-            y_emb = model.id2emb(data_batch.src_token_ids)
+            if hasattr(model, "module"):
+                y_emb = model.module.id2emb(data_batch.src_token_ids)
+            else:
+                y_emb = model.id2emb(data_batch.src_token_ids)
+            
             B, N, _ = x0.shape
 
             sample_size = getattr(args, 'sample_size', 1)

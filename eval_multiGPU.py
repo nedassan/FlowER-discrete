@@ -8,8 +8,7 @@ from rdkit import Chem
 from utils.data_utils import ReactionDataset, BEmatrix_to_mol, ps
 from utils.rounding import saferound_tensor
 import torch.distributed as dist
-from train import init_model, init_loader
-from utils.train_utils import log_rank_0, setup_logger, log_args
+from utils.train_utils import log_rank_0
 from settings import Args
 from collections import defaultdict
 import time
@@ -72,16 +71,31 @@ def tau_leaping_batch_scatter(
 
     for i in range(steps):
         t = torch.full((B,), i / steps, device=device)
-        s_logits, t_logits = model(y_emb, y_len, xt, t)
+        
+        s_logits, t_logits, stop_logits = model(y_emb, y_len, xt, t)
 
         s_flat = (0.5 * (s_logits + s_logits.transpose(1, 2)))[..., 1].view(B, -1)
         s_flat = s_flat.masked_fill(mask, -1e12)
 
+        log_sum_s = torch.logsumexp(s_flat, dim=-1)
+        s_stop_logit = stop_logits[:, 0]
+
+        log_total_s = torch.logaddexp(log_sum_s, s_stop_logit)
+
+        log_p_active_s = log_sum_s - log_total_s
+        p_active_s = torch.exp(log_p_active_s)
+
         t_flat = (0.5 * (t_logits + t_logits.transpose(1, 2)))[..., 1].view(B, -1)
         t_flat = t_flat.masked_fill(mask, -1e12)
+        
+        log_sum_t = torch.logsumexp(t_flat, dim=-1)
+        t_stop_logit = stop_logits[:, 1]
+        log_total_t = torch.logaddexp(log_sum_t, t_stop_logit)
+        log_p_active_t = log_sum_t - log_total_t
+        p_active_t = torch.exp(log_p_active_t)
 
-        s_rate = torch.exp(torch.logsumexp(s_flat, dim=-1))
-        t_rate = torch.exp(torch.logsumexp(t_flat, dim=-1))
+        s_rate = torch.exp(log_sum_s) * p_active_s
+        t_rate = torch.exp(log_sum_t) * p_active_t
         rates = s_rate * t_rate
 
         max_j = max_jumps_per_atom * y_len
@@ -91,6 +105,7 @@ def tau_leaping_batch_scatter(
             continue
 
         max_batch_j = total_jumps.max().item()
+        
         src_samples = torch.multinomial(torch.softmax(s_flat, dim=-1), max_batch_j, replacement=True)
         tgt_samples = torch.multinomial(torch.softmax(t_flat, dim=-1), max_batch_j, replacement=True)
 

@@ -156,14 +156,20 @@ def main(args):
     if dist.get_rank() == 0:
         config_dict = {k: v for k, v in vars(args).items() if not k.startswith('__')}
 
-        run_id = hashlib.md5(args.exp_name.encode('utf-8')).hexdigest()
+        if state and "run_id" in state:
+            run_id = state["run_id"]
+            log_rank_0(f"Resuming WandB run ID: {run_id}")
+        else:
+            run_id = wandb.util.generate_id()
+            log_rank_0(f"Generated new WandB run ID: {run_id}")
         
         wandb.init(
             project=args.log_file, 
             name=args.exp_name, 
             id=run_id,
             resume="allow",
-            config=config_dict
+            config=config_dict,
+            settings=wandb.Settings(init_timeout=300)
         )
 
     log_rank_0(f"Initializing training ...")
@@ -303,7 +309,8 @@ def main(args):
                             "total_step": total_step,
                             "state_dict": model.state_dict(),
                             "optimizer": optimizer.state_dict(),
-                            "scheduler": scheduler.state_dict() if scheduler else None
+                            "scheduler": scheduler.state_dict() if scheduler else None,
+                            "run_id": wandb.run.id
                         }
                         torch.save(state, os.path.join(args.model_path, f"model.{total_step}_{n_iter}.pt"))
 

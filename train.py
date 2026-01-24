@@ -287,7 +287,7 @@ def main(args):
                         metrics = np.array(metrics)
                         
                         total_correct = np.sum(metrics[:, 0])
-                        total_samples = np.sum(metrics)
+                        total_samples = len(metrics)
                         
                         val_acc = total_correct / total_samples if total_samples > 0 else 0.0
                         
